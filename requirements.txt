@@ -1,0 +1,5 @@
+# MacroSmith 宏匠 —— 依赖清单
+# Python 3.11+ （开发环境实测 Python 3.13）
+
+PySide6>=6.8.0      # GUI 框架（Qt for Python）
+pynput>=1.7.7       # 键鼠监听与模拟

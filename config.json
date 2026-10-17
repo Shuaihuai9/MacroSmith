@@ -1,0 +1,36 @@
+{
+  "hotkeys": {
+    "record_stop": "f9",
+    "play_toggle": "f6",
+    "pause_toggle": "f7",
+    "play_stop": "f8",
+    "step_next": "page_down",
+    "step_prev": "page_up",
+    "step_reset": "home"
+  },
+  "window": {
+    "x": 1876,
+    "y": 553,
+    "width": 1000,
+    "height": 700
+  },
+  "hotkey_exclusive": true,
+  "merge": {
+    "combo": true,
+    "multi_click": true
+  },
+  "loop": {
+    "mode": "none",
+    "count": 7
+  },
+  "player": {
+    "default_mode": "timed",
+    "speed": 1.0,
+    "move_min_interval_ms": 50,
+    "move_min_distance_px": 2,
+    "record_mouse_move": true,
+    "record_clicks_only": false
+  },
+  "scripts_dir": "data/scripts",
+  "last_script": ""
+}
