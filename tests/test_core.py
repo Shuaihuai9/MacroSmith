@@ -22,6 +22,7 @@ from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
 from core.hotkey_manager import HotkeyManager, display_name, normalize_token, parse_key
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import Recorder, key_to_token, token_to_key
+from core.poll_recorder import PollRecorder, _is_blacklisted_process
 
 
 # ---------------------------------------------------------------------------
@@ -2675,3 +2676,53 @@ class TestConfig:
         path = cfg.scripts_path()
         assert path.exists()
         assert path.name == "scripts"
+
+
+# ---------------------------------------------------------------------------
+# 兼容轮询录制器（PollRecorder）
+# ---------------------------------------------------------------------------
+
+class TestPollRecorderBlacklist:
+    """前台进程黑名单匹配（纯函数）。"""
+
+    def test_tencent_processes_match(self):
+        for stem in ("wegame", "QQGame", "SGuard64", "wegame_helper",
+                     "tgp_daemon", "AntiCheatExpert"):
+            assert _is_blacklisted_process(stem), stem
+
+    def test_normal_processes_no_match(self):
+        for stem in ("", "explorer", "chrome", "notepad", "code"):
+            assert not _is_blacklisted_process(stem), stem
+
+
+class TestPollRecorderLifecycle:
+    """轮询通道的启停与时间基（真实 WinAPI，周期短、无 UI 依赖）。"""
+
+    def test_start_stop_empty_without_blacklist_foreground(self):
+        rec = PollRecorder()
+        assert rec.is_recording is False
+        assert rec.start(t0=time.monotonic()) is True
+        assert rec.is_recording is True
+        assert rec.start(t0=time.monotonic()) is False  # 重复启动被拒
+        assert rec.stop() == []
+        assert rec.is_recording is False
+
+    def test_stop_is_idempotent(self):
+        rec = PollRecorder()
+        assert rec.stop() == []
+        rec.start(t0=time.monotonic())
+        rec.stop()
+        assert rec.stop() == []
+
+    def test_elapsed_uses_shared_t0(self):
+        rec = PollRecorder()
+        t0 = time.monotonic() - 1.0
+        rec.start(t0=t0)
+        try:
+            # 时基对齐：elapsed 应接近 1000ms（允许轮询周期误差）
+            assert 900 <= rec.elapsed_ms() <= 1300
+        finally:
+            rec.stop()
+
+    def test_recorder_t0_property_before_start(self):
+        assert Recorder().t0 == 0.0

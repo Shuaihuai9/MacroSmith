@@ -31,8 +31,13 @@ def project_root() -> Path:
 
 
 def is_frozen() -> bool:
-    """是否运行在 PyInstaller 打包后的 exe 中。"""
-    return bool(getattr(sys, "frozen", False))
+    """是否运行在打包后的 exe 中。
+
+    - PyInstaller 设置 ``sys.frozen``
+    - Nuitka 编译的每个模块带模块级 ``__compiled__`` 属性
+      （本模块被 Nuitka 编译后其 globals() 里就有它）
+    """
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
 def app_data_dir() -> Path:
@@ -65,6 +70,20 @@ def ensure_dir(path: Path) -> Path:
 # ---------------------------------------------------------------------------
 # DPI 感知
 # ---------------------------------------------------------------------------
+
+def is_admin() -> bool:
+    """当前进程是否以管理员（提升后的令牌）运行。
+
+    腾讯系界面（WeGame/QQ游戏大厅等）的相关进程常以更高完整性级别运行，
+    UIPI 会阻止低权限进程读取其前台时的按键状态（GetAsyncKeyState 返回
+    未按下），而全局光标位置 GetCursorPos 不受限——这正是“能录到移动、
+    录不到点击”的原因。以管理员运行本程序后该限制即解除。
+    """
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # pragma: no cover - 非 Windows 或异常时保守返回 False
+        return False
+
 
 def enable_dpi_awareness() -> None:
     """开启进程 DPI 感知，避免高分屏下界面模糊与坐标错位。"""
@@ -218,6 +237,13 @@ def icon_search_paths() -> list[Path]:
     if meipass:
         for rel in ICON_RELATIVE_PATHS:
             candidates.append(Path(meipass) / rel)
+    # exe 所在目录（PyInstaller onedir / Nuitka standalone 的产物根目录）
+    try:
+        exe_dir = Path(sys.executable).resolve().parent
+        for rel in ICON_RELATIVE_PATHS:
+            candidates.append(exe_dir / rel)
+    except (OSError, ValueError):
+        pass
     for rel in ICON_RELATIVE_PATHS:
         candidates.append(project_root() / rel)
     for rel in ICON_RELATIVE_PATHS:

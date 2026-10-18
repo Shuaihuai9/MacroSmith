@@ -94,6 +94,15 @@ class Recorder:
         with self._lock:
             return len(self._events)
 
+    @property
+    def t0(self) -> float:
+        """录制起点（``time.monotonic()`` 秒）。
+
+        供并行运行的兼容轮询通道（:class:`core.poll_recorder.PollRecorder`）
+        对齐时间基，保证两通道事件时间戳可直接合并排序。
+        """
+        return self._t0
+
     def elapsed_ms(self) -> int:
         """当前已录制时长（毫秒）。"""
         with self._lock:

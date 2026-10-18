@@ -11,7 +11,6 @@
   里完成：改数据 → 重排时间戳 → 同步回放器与列表 → 置脏标记。
 """
 
-from __future__ import annotations
 
 import logging
 import time
@@ -29,6 +28,7 @@ from core.config import Config, HOTKEY_LABELS
 from core.hotkey_manager import HotkeyManager, display_name, parse_key
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import Recorder
+from core.poll_recorder import PollRecorder
 from ui import icons, styles
 from ui.event_list import EventListWidget, _make_icon
 from ui.frameless import WindowShell
@@ -39,7 +39,7 @@ from ui.name_dialog import ask_name, script_stems
 from ui.step_dialog import InsertStepDialog
 from ui.step_editor import edit_step_dialog
 from ui.time_dialog import ask_total_duration
-from utils.win_utils import WINDOW_TITLE, ensure_dir
+from utils.win_utils import WINDOW_TITLE, ensure_dir, is_admin
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ class MainWindow(WindowShell):
     sig_player_event = Signal(int, dict)  # 模式一执行到某条原始事件
     sig_player_finished = Signal(str)    # finished / stopped
     sig_player_error = Signal(str)
+    sig_poll_stop = Signal()             # 兼容轮询通道检测到停止热键（轮询线程）
 
     def __init__(self, config: Optional[Config] = None) -> None:
         super().__init__(WINDOW_TITLE)
@@ -143,6 +144,16 @@ class MainWindow(WindowShell):
             on_event=self._on_recorder_event,
             on_error=self.sig_recorder_error.emit,
         )
+        # 兼容轮询通道：腾讯系（WeGame/QQ游戏大厅）前台时低层钩子被反作弊
+        # 过滤，轮询通道自动接管；普通前台时它不产事件，与钩子通道互补。
+        self.poll_recorder = PollRecorder(
+            is_executing=lambda: self.player.is_executing,
+            on_event=self._on_recorder_event,
+            on_error=self.sig_recorder_error.emit,
+            on_stop_hotkey=self.sig_poll_stop.emit,
+        )
+        # 轮询线程检测到「停止录制热键」按下沿 -> 切回主线程停止录制
+        self.sig_poll_stop.connect(self.stop_recording)
         self.player = MacroPlayer(
             on_event=lambda idx, evt: self.sig_player_event.emit(idx, evt),
             on_finished=self.sig_player_finished.emit,
@@ -664,6 +675,24 @@ class MainWindow(WindowShell):
         if not ok:
             self._on_error("录制启动失败：可能是监听器无法启动（权限或安全软件限制）。")
             return
+        # 兼容通道与钩子通道共用时间基与参数；它只在腾讯系前台产出事件，
+        # 启动失败不影响普通录制，仅记录日志。
+        stop_vk = 0x78  # 默认 F9
+        try:
+            token = (self.config.get("hotkeys", {}) or {}).get(
+                "record_stop", "f9")
+            vk = getattr(parse_key(token), "vk", None)
+            if isinstance(vk, int):
+                stop_vk = vk
+        except Exception:
+            log.debug("解析停止热键 VK 失败，兼容通道使用默认 F9", exc_info=True)
+        if not self.poll_recorder.start(
+                t0=self.recorder.t0,
+                stop_vk=stop_vk,
+                min_interval_ms=int(player.get("move_min_interval_ms", 50)),
+                min_distance_px=int(player.get("move_min_distance_px", 2)),
+        ):
+            log.warning("兼容轮询通道启动失败，普通窗口录制不受影响。")
         self._set_state(State.RECORDING)
         self.event_list.clear()
         self._script_events = []
@@ -683,12 +712,15 @@ class MainWindow(WindowShell):
         if self.state is not State.RECORDING:
             return
         self._record_timer.stop()
-        events = self.recorder.stop()
+        self.recorder.stop()
+        self.poll_recorder.stop()
+        # 两通道事件都经 on_event 管线实时进入 _script_events，此处统一清洗：
+        # 补全未释放按键、剔除停止热键、保证时间戳单调（sanitize 幂等）。
+        self._flush_ui_buffers()
+        events = ep.sanitize_events(
+            self._script_events, ignore_keys=self.recorder.ignored_keys)
         if not events:
-            # 监听器一条都没记到时，退回界面缓冲里收到的事件：
-            # 既覆盖“监听器不可用但在自检里注入了事件”的场景，
-            # 也保证不会把已经显示出来的事件列表清空。
-            self._flush_ui_buffers()
+            # 兜底：清洗后为空时退回原始缓冲，保证界面流程走通
             events = list(self._script_events)
         self._sync_after_recording(events)
         duration = ep.events_duration_ms(events) if events else 0
@@ -735,10 +767,12 @@ class MainWindow(WindowShell):
         """录制中的状态栏计时刷新。"""
         if self.state is State.RECORDING:
             elapsed = self.recorder.elapsed_ms() / 1000.0
-            self.message_label.setText(
-                f"正在录制… 已录制 {elapsed:.1f} 秒 / {self.recorder.event_count} 条事件"
-            )
-            self.event_count_label.setText(f"事件 {self.recorder.event_count} 条")
+            total = self.recorder.event_count + self.poll_recorder.event_count
+            text = f"正在录制… 已录制 {elapsed:.1f} 秒 / {total} 条事件"
+            if not is_admin():
+                text += "（未以管理员运行：腾讯系界面可能录不到按键，请用管理员身份启动）"
+            self.message_label.setText(text)
+            self.event_count_label.setText(f"事件 {total} 条")
 
     # ==================================================================
     # 模式一：原速回放
