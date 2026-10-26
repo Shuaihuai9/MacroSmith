@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -854,6 +855,49 @@ def steps_to_events(steps: Sequence[Step],
     return out
 
 
+def step_gaps(steps: Sequence[Step]) -> list[int]:
+    """返回每一步「与前一步之间的空白间隔」（毫秒）。
+
+    数据结构约定（本版本的时间模型）
+    --------------------------------
+    * **动作时长**：``step.t_end - step.t_start``，即步骤自身占用的时间；
+    * **空白间隔**：``本步 t_start - 上一步 t_end``，不写进事件数据，
+      由时间戳派生（间隔被完整保留时它才等于录制时的原始节奏）。
+
+    返回列表与 ``steps`` 等长；第 0 项是该步骤相对时间轴起点（0）的偏移。
+    """
+    gaps: list[int] = []
+    previous_end = 0
+    for position, step in enumerate(steps):
+        start = int(step.t_start)
+        gaps.append(max(0, start - (previous_end if position else 0)))
+        previous_end = int(step.t_end)
+    return gaps
+
+
+def layout_with_gaps(events: Sequence[dict[str, Any]],
+                     gaps: Sequence[int]) -> list[dict[str, Any]]:
+    """按给定的步间间隔把各步骤重新铺到时间轴上。
+
+    步骤**内部**事件的相对偏移保持不变（按住时长、组合键节奏不破坏），
+    只有步骤之间的空白被替换成 ``gaps`` 里的值。用于「编辑单步时保留
+    前后间隔」——避免把录制节奏压成固定的 20ms。
+    """
+    result = [dict(e) for e in events]
+    if not result:
+        return result
+    segments = segment_bounds(result)
+    cursor = 0
+    for position, (lo, hi) in enumerate(segments):
+        gap = int(gaps[position]) if position < len(gaps) else int(MIN_STEP_GAP_MS)
+        cursor += max(0, gap)
+        origin = int(result[lo].get("t") or 0)
+        for index in range(lo, hi):
+            result[index]["t"] = cursor + (int(result[index].get("t") or 0) - origin)
+        cursor = int(result[hi - 1].get("t") or cursor)
+    return result
+
+
 def normalize_timestamps(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """重排事件时间戳：段内保持相对偏移，段间统一为固定的步间隔。
 
@@ -1197,6 +1241,60 @@ def _interpolate_move_frames(events: list[dict[str, Any]], span_ms: int
     return out
 
 
+def _rebuild_move_path(events: list[dict[str, Any]],
+                       start: tuple[int, int],
+                       end: tuple[int, int]) -> list[dict[str, Any]]:
+    """重建**多帧**移动步骤的坐标轨迹，帧数与时间戳原样保留。
+
+    三条分支（顺序很重要，避免再次把轨迹压平）：
+
+    * **起止点都没改** → 中间帧原样保留：用户只改时长/其他字段时，
+      录制下来的真实轨迹（含曲线、抖动）必须完整保住；
+    * **中间帧已被压成端点**（历史 Bug 留下的「无轨迹」数据：所有中间帧
+      等于终点）→ 按时间比例在起止点之间线性插值补齐，恢复平滑移动；
+    * **用户改了起止点** → 按原有相对位置做仿射映射，尽量保留轨迹形状。
+    """
+    n = len(events)
+    out = [dict(e) for e in events]
+    sx, sy = int(start[0]), int(start[1])
+    ex, ey = int(end[0]), int(end[1])
+    out[0]["x"], out[0]["y"] = sx, sy
+    out[-1]["x"], out[-1]["y"] = ex, ey
+    if n <= 2:
+        return out
+
+    orig_start = (int(events[0].get("x") or 0), int(events[0].get("y") or 0))
+    orig_end = (int(events[-1].get("x") or 0), int(events[-1].get("y") or 0))
+    t0 = int(events[0].get("t") or 0)
+    span = int(events[-1].get("t") or 0) - t0
+    middles = [(int(e.get("x") or 0), int(e.get("y") or 0)) for e in events[1:-1]]
+    # 中间帧全部等于终点 = 没有轨迹（旧 Bug 写坏的数据）。必须放在
+    # 「起止点未改动」判断之前，否则这种坏数据会被当成「轨迹没改」直接返回。
+    collapsed = bool(middles) and all(pt == orig_end for pt in middles)
+    if collapsed and span > 0:
+        for index in range(1, n - 1):
+            ratio = (int(events[index].get("t") or 0) - t0) / span
+            out[index]["x"] = int(round(sx + (ex - sx) * ratio))
+            out[index]["y"] = int(round(sy + (ey - sy) * ratio))
+        return out
+
+    # 起止点未改动：直接返回，中间帧（真实轨迹）一条都不动
+    if orig_start == (sx, sy) and orig_end == (ex, ey):
+        return out
+
+    # 起止点被改动：按原相对位置做仿射映射，保留轨迹形状
+    dx_old = orig_end[0] - orig_start[0]
+    dy_old = orig_end[1] - orig_start[1]
+    for index in range(1, n - 1):
+        px = int(events[index].get("x") or 0)
+        py = int(events[index].get("y") or 0)
+        ux = (px - orig_start[0]) / dx_old if dx_old else 0.0
+        uy = (py - orig_start[1]) / dy_old if dy_old else 0.0
+        out[index]["x"] = int(round(sx + ux * (ex - sx)))
+        out[index]["y"] = int(round(sy + uy * (ey - sy)))
+    return out
+
+
 def _rebuild_step_events(step: Step, *, x: Optional[int] = None,
                          y: Optional[int] = None, button: Optional[str] = None,
                          click_count: Optional[int] = None,
@@ -1218,37 +1316,34 @@ def _rebuild_step_events(step: Step, *, x: Optional[int] = None,
 
     # ---------------- 鼠标移动 / 滚轮：只改坐标（滚轮还可改格数） ----------------
     if kind in ("move", "scroll"):
-        out: list[dict[str, Any]] = []
         n = len(events)
         has_start = (kind == "move"
                      and (start_x is not None or start_y is not None))
-        for i, evt in enumerate(events):
-            item = dict(evt)
-            is_first = (i == 0)
-            is_last = (i == n - 1)
-            # 多事件步骤：首事件填起始坐标（单事件视为目标点，起始点在下方补插）
-            if kind == "move" and has_start and is_first and n > 1:
-                if start_x is not None:
-                    item["x"] = int(start_x)
-                if start_y is not None:
-                    item["y"] = int(start_y)
-            elif kind == "move" and has_start and is_last:
+        if kind == "move" and n > 1:
+            # 多帧移动：走轨迹重建，绝不能把中间帧坐标统一改成终点
+            # （旧实现这么干，回放时指针会一步跳到目标点）
+            start_xy = (int(start_x) if start_x is not None
+                        else int(events[0].get("x") or 0),
+                        int(start_y) if start_y is not None
+                        else int(events[0].get("y") or 0))
+            end_xy = (int(x) if x is not None else int(events[-1].get("x") or 0),
+                      int(y) if y is not None else int(events[-1].get("y") or 0))
+            out = _rebuild_move_path(events, start_xy, end_xy)
+        else:
+            # 滚轮 / 单帧移动：坐标只有一个点，直接写入目标值
+            out = []
+            for evt in events:
+                item = dict(evt)
                 if x is not None:
                     item["x"] = int(x)
                 if y is not None:
                     item["y"] = int(y)
-            else:
-                # scroll 或无起始坐标的 move：统一改目标坐标
-                if x is not None:
-                    item["x"] = int(x)
-                if y is not None:
-                    item["y"] = int(y)
-            if kind == "scroll":
-                if dx is not None:
-                    item["dx"] = int(dx)
-                if dy is not None:
-                    item["dy"] = int(dy)
-            out.append(item)
+                if kind == "scroll":
+                    if dx is not None:
+                        item["dx"] = int(dx)
+                    if dy is not None:
+                        item["dy"] = int(dy)
+                out.append(item)
         # move 且只有一条事件但用户指定了起始坐标 → 补一条起始事件
         if has_start and n == 1:
             first = dict(events[0])
@@ -1454,15 +1549,22 @@ def _place_new_events(events: Sequence[dict[str, Any]], base_t: int) -> list[dic
 
 def replace_step(steps: Sequence[Step], index: int,
                  events: Sequence[dict[str, Any]],
-                 kind: Optional[str] = None) -> list[dict[str, Any]]:
+                 kind: Optional[str] = None,
+                 preserve_gaps: bool = True) -> list[dict[str, Any]]:
     """用新的事件替换第 ``index`` 步（编辑现有步骤参数）。
 
     ``kind`` 留空时沿用原步骤类型；显式传入时用于「单击 → 双击」这类
     类型变化的编辑。
+
+    ``preserve_gaps=True``（默认）时**保留原有的步间空白间隔**，只替换
+    这一步的内容 —— 这是修复「改一步时长把后续间隔全压成 20ms」的关键：
+    其余步骤之间的录制节奏原封不动地保留在时间轴上。
+    传 ``False`` 则退回旧的「全部重排成固定 20ms 间隔」行为。
     """
     steps = list(steps)
     if index < 0 or index >= len(steps):
         raise StepEditError("步骤下标越界")
+    old_gaps = step_gaps(steps) if preserve_gaps else None
     old = steps[index]
     steps[index] = Step(
         index=index + 1,
@@ -1471,7 +1573,7 @@ def replace_step(steps: Sequence[Step], index: int,
         events=[dict(e) for e in events],
         raw_start=0, raw_end=len(events),
     )
-    return _renormalize(steps_to_events(steps))
+    return _renormalize(steps_to_events(steps), old_gaps)
 
 
 def split_click_step(step: Step) -> list[list[dict[str, Any]]]:
@@ -1550,9 +1652,17 @@ def _kind_for_events(events: Sequence[dict[str, Any]]) -> str:
     return "click"
 
 
-def _renormalize(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """重排时间戳并**重新打上步骤边界**，保证编辑后的步骤粒度不被合并逻辑改变。"""
-    return steps_to_events(build_steps(normalize_timestamps(events)))
+def _renormalize(events: Sequence[dict[str, Any]],
+                 gaps: Optional[Sequence[int]] = None) -> list[dict[str, Any]]:
+    """重排时间戳并**重新打上步骤边界**，保证编辑后的步骤粒度不被合并逻辑改变。
+
+    ``gaps`` 为空时沿用旧行为（步间统一压到 :data:`MIN_STEP_GAP_MS`，
+    用于删除/移动/拆分这类结构变更）；传入间隔列表时按原间隔铺设，
+    用于「只改了某一步内容/时长」的编辑——保留录制节奏。
+    """
+    if gaps is None:
+        return steps_to_events(build_steps(normalize_timestamps(events)))
+    return steps_to_events(build_steps(layout_with_gaps(events, gaps)))
 
 def events_duration_ms(events: Sequence[dict[str, Any]]) -> int:
     """事件序列的总时长（最后一条事件的时间戳）。"""
@@ -1642,19 +1752,70 @@ def set_step_duration(events: Sequence[dict[str, Any]], step_index: int,
     return events
 
 
+def set_step_gap(events: Sequence[dict[str, Any]], step_index: int,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> list[dict[str, Any]]:
+    """修改某一步与上一步 / 下一步之间的**空白间隔**（第十一阶段）。
+
+    时间模型（与 :func:`step_gaps` 一致）：
+
+    * **动作时长**（步骤自身持续）由 :func:`set_step_duration` 负责；
+    * **空白间隔**（两步之间的空档）由本函数负责，二者互不干扰。
+
+    处理方式：
+
+    * 改「与上一步的间隔」：本步及其后所有步骤整体平移
+      ``新间隔 - 旧间隔``，前序步骤不动；
+    * 改「与下一步的间隔」：下一步及其后所有步骤整体平移，
+      本步不动；
+    * 间隔一律夹到 >= 0，保证时间轴不出现负数或步骤重叠。
+
+    返回新的完整事件序列（未改动时原样返回）。
+    """
+    events = [dict(e) for e in events]
+    steps = build_steps(events)
+    total = len(steps)
+    if not 0 <= step_index < total:
+        raise StepEditError(f"步骤下标越界：{step_index}（共 {total} 步）")
+
+    # ---- 与上一步的间隔：平移本步及之后的所有事件 ----
+    if gap_before_ms is not None:
+        current = step_gaps(steps)[step_index]
+        delta = max(0, int(gap_before_ms)) - current
+        if delta:
+            for event in events[steps[step_index].raw_start:]:
+                event["t"] = int(event.get("t") or 0) + delta
+            steps = build_steps(events)   # 重新计算区间，供下一步使用
+
+    # ---- 与下一步的间隔：平移下一步及之后的所有事件 ----
+    if gap_after_ms is not None and step_index + 1 < total:
+        current = step_gaps(steps)[step_index + 1]
+        delta = max(0, int(gap_after_ms)) - current
+        if delta:
+            for event in events[steps[step_index + 1].raw_start:]:
+                event["t"] = int(event.get("t") or 0) + delta
+    return events
+
+
 def redistribute_duration(events: Sequence[dict[str, Any]],
-                          target_ms: int) -> list[dict[str, Any]]:
-    """把整段脚本的总时长重设为 ``target_ms``，各步骤均匀分布。
+                          target_ms: int,
+                          avg_gap_ms: Optional[int] = None,
+                          jitter_ms: int = 0,
+                          rng: Optional[random.Random] = None
+                          ) -> list[dict[str, Any]]:
+    """把整段脚本的总时长重设为 ``target_ms``，按平均间隔 + 随机浮动铺开。
 
-    分配方式：
+    分配算法（第十一阶段：新增平均间隔与随机浮动）
+    ----------------------------------------------
+    1. ``Action_Time`` = 所有步骤**动作时长**之和（各步 ``t_end - t_start``）；
+    2. ``Gap_Time``    = ``目标总时长 - Action_Time``（不够时按 0 处理）；
+    3. ``Base_Gap``    = ``Gap_Time / (步数 - 1)``（最后一步之后没有间隔）；
+       若用户显式填了「平均步间间隔」（``avg_gap_ms`` > 0），则直接以它为准，
+       此时总时长以间隔设置为准、不再强求等于目标值；
+    4. 每个间隔 = ``Base_Gap + random(-jitter_ms, +jitter_ms)``，夹到 >= 0；
+    5. 按生成的间隔重新计算每步起止时间戳（步骤内部相对偏移保持不变）。
 
-    * 先算出每一步骤自身占用的时长（``t_end - t_start``，只有点击/按键这类
-      有按住时间的事件才非 0）；
-    * 步骤之间用**统一的间隔**均分剩余时间，间隔至少为
-      :data:`MIN_STEP_GAP_MS`；
-    * 步骤内部相对偏移保持不变。
-
-    这样模式一按新时间轴原速回放，总时长就等于用户输入的目标值。
+    ``rng`` 可注入固定种子的随机源，便于测试复现。
     """
     events = [dict(e) for e in events]
     if not events:
@@ -1665,19 +1826,39 @@ def redistribute_duration(events: Sequence[dict[str, Any]],
     if count == 0:
         return events
 
-    # 每段自身的跨度（段内最后一条 − 首条）
+    # 每段自身的动作时长（段内最后一条 − 首条），不含步骤之间的空白
     spans = [int(events[hi - 1].get("t") or 0) - int(events[lo].get("t") or 0)
              for lo, hi in segments]
-    total_span = sum(spans)
-    gaps_total = max(0, target_ms - total_span)
-    # count 段之间有 count-1 个间隔；单段时没有间隔
-    gap = int(gaps_total / (count - 1)) if count > 1 else 0
-    gap = max(0, gap)
+    action_total = sum(spans)
+    gap_count = count - 1
+    gap_total = max(0, target_ms - action_total)
+
+    # 基础平均间隔：显式输入优先，否则由「剩余时间 / 间隔个数」推导
+    explicit_gap = int(avg_gap_ms or 0)
+    if explicit_gap > 0:
+        base_gap = explicit_gap
+    elif gap_count > 0:
+        base_gap = int(gap_total / gap_count)
+    else:
+        base_gap = 0
+    base_gap = max(0, base_gap)
+
+    jitter = max(0, int(jitter_ms))
+    source = rng if rng is not None else random
+    gaps: list[int] = []
+    for _ in range(gap_count):
+        value = base_gap
+        if jitter:
+            value += source.randint(-jitter, jitter)
+        gaps.append(max(0, value))
+    # 没有随机浮动时，把除不尽的余数补给最后一个间隔，保证总时长精确命中目标
+    if gaps and not jitter and explicit_gap <= 0:
+        gaps[-1] += max(0, gap_total - base_gap * gap_count)
 
     cursor = 0
     for position, (lo, hi) in enumerate(segments):
         if position > 0:
-            cursor += gap
+            cursor += gaps[position - 1]
         raw_start = int(events[lo].get("t") or 0)
         for offset_index in range(lo, hi):
             offset = int(events[offset_index].get("t") or 0) - raw_start

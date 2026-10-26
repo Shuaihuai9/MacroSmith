@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -70,8 +72,43 @@ def install_excepthook() -> None:
     sys.excepthook = hook
 
 
+def relaunch_as_admin() -> bool:
+    """非管理员时用 runas 重新拉起自身，返回是否已发起重启。
+
+    腾讯系平台（QQ游戏大厅 / WeGame）的部分进程以更高完整性级别运行，
+    UIPI 会阻止普通权限进程读取前台按键状态，导致录制不到点击与键盘。
+    打包版由 ``--windows-uac-admin`` 清单保证提权，这里兜底开发版以及
+    清单失效的环境。``--check`` 模式不重启，避免自检直接返回空结果。
+    """
+    from utils.win_utils import is_admin, is_frozen
+
+    if is_admin() or "--check" in sys.argv[1:]:
+        return False
+    # 哨兵：避免极端环境下子进程仍未提权导致的反复重启死循环
+    if os.environ.get("MACROSMITH_ELEVATED") == "1":
+        return False
+    if is_frozen():
+        exe, params = sys.executable, sys.argv[1:]
+    else:
+        exe, params = sys.executable, [str(PROJECT_ROOT / "main.py"), *sys.argv[1:]]
+    try:
+        os.environ["MACROSMITH_ELEVATED"] = "1"
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe,
+            subprocess.list2cmdline(params) if params else None,
+            str(PROJECT_ROOT), 1,
+        )
+    except Exception:  # pragma: no cover - 提权失败时按普通权限继续
+        return False
+    # ShellExecuteW 返回值 > 32 表示成功；用户点“否”时为 5（拒绝访问）
+    return int(result) > 32
+
+
 def main() -> int:
     """程序主入口。"""
+    # 没有管理员权限时先提权重启：腾讯系界面需要更高完整性才能读到按键
+    if relaunch_as_admin():
+        return 0
     # DPI 感知必须在 Qt 初始化之前设置
     from utils.win_utils import acquire_single_instance, enable_dpi_awareness
 
@@ -213,8 +250,8 @@ def run_startup_check(app, window, log) -> int:
          "编辑这一步 / 重设总时长（改时间已并入「编辑这一步」弹窗）"),
         ("脚本库就绪", page.table.columnCount() == 4,
          f"{page.table.columnCount()} 列"),
-        ("历史脚本下拉框", combo.isEditable() and window.btn_new_script.isEnabled(),
-         f"可编辑，已列出 {combo_scripts} 个脚本，旁边有「新建脚本」按钮"),
+        ("历史脚本下拉框", (not combo.isEditable()) and window.btn_new_script.isEnabled(),
+         f"纯下拉选择（不可输入），已列出 {combo_scripts} 个脚本，旁边有「新建脚本」按钮"),
         ("弹窗样式统一", "QSpinBox::up-button" in build_stylesheet()
          and "QSpinBox::down-arrow" in build_stylesheet(),
          "步骤编辑/时间/命名弹窗共用主界面 QSS，SpinBox 调节按钮已覆盖原生样式"),

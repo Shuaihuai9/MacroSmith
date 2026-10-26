@@ -11,7 +11,6 @@
 天然就是屏幕坐标，无需任何换算。
 """
 
-from __future__ import annotations
 
 from typing import Optional
 

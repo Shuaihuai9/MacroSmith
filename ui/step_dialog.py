@@ -8,7 +8,6 @@
 * **键盘按键**：单键捕获 + 重复次数
 """
 
-from __future__ import annotations
 
 from typing import Any, Optional
 

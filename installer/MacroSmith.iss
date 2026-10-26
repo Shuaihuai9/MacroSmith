@@ -9,7 +9,7 @@
 ; 前置条件：先跑 PyInstaller 打包（见 打包发布步骤.md），
 ; 产物 dist\MacroSmith\ 文件夹必须已存在。
 ;
-; 产物：installer\Output\MacroSmith-Setup-1.0.0.exe
+; 产物：installer\Output\MacroSmith-Setup-1.1.0.exe
 ;
 ; 用户数据说明（重要）：
 ;   - 本脚本只安装 Program Files 下的程序文件；
@@ -19,7 +19,7 @@
 
 #define MyAppName "MacroSmith"
 #define MyAppNameCN "宏匠"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppExeName "MacroSmith.exe"
 
 [Setup]

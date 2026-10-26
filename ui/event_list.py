@@ -3,7 +3,7 @@
 界面结构（整体是一张白色卡片）::
 
     ┌ 步骤编辑 共 12 步  [已选 3 步]                     ─────────────┐
-    │ [全选] [反选] [取消]  │  [删除] [上移] [下移] [插入]  │  [保存] │
+    │ [全选] [反选]  │  [删除] [上移] [下移] [插入]  │  [保存] │
     ├────────────────────────────────────────────────────────────────┤
     │ ☑ 序号 类型     内容                        时间              │
     │ ☑  1   鼠标移动 移动到 (640, 400)            0.000s → 0.090s  │
@@ -15,11 +15,10 @@
 * 编辑动作本身不在这里实现，全部通过信号交给主窗口处理
 """
 
-from __future__ import annotations
 
 from typing import Any, Optional, Sequence
 
-from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QModelIndex, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView,
                                QLabel, QMenu, QPushButton, QStyle,
@@ -114,7 +113,7 @@ class _RowDelegate(QStyledItemDelegate):
         return QSize(34, 30)
 
 
-def _draw_checkbox(painter: QPainter, cell: "QRectF", checked: bool) -> None:
+def _draw_checkbox(painter: QPainter, cell: QRectF, checked: bool) -> None:
     """画一个 4px 圆角复选框，选中时填充强调色并打勾。"""
     size = 15.0
     box = QRectF(0, 0, size, size)
@@ -193,9 +192,8 @@ class EventListWidget(QWidget):
             "全选", icons.ICON_CHECK_ALL, "勾选全部步骤", secondary=True)
         self.btn_invert = self._tool_button(
             "反选", icons.ICON_INVERT, "反转当前勾选状态", secondary=True)
-        self.btn_clear_sel = self._tool_button(
-            "取消选择", icons.ICON_CHECK_NONE, "清空勾选", secondary=True)
-        for btn in (self.btn_select_all, self.btn_invert, self.btn_clear_sel):
+        # 不再提供「取消选择」按钮：点击任何非复选框区域即自动清除勾选
+        for btn in (self.btn_select_all, self.btn_invert):
             toolbar1.addWidget(btn)
 
         toolbar1.addWidget(self._separator())
@@ -211,7 +209,7 @@ class EventListWidget(QWidget):
             toolbar1.addWidget(btn)
 
         toolbar1.addStretch(1)
-        self.btn_save = self._tool_button("保存修改", icons.ICON_SAVE,
+        self.btn_save = self._tool_button("保存", icons.ICON_SAVE,
                                           "把编辑后的步骤序列写回脚本文件", primary=True)
         toolbar1.addWidget(self.btn_save)
         card_layout.addLayout(toolbar1)
@@ -284,6 +282,8 @@ class EventListWidget(QWidget):
         self.table.setColumnWidth(COL_TIME, 190)
 
         self.table.cellClicked.connect(self._on_cell_clicked)
+        # 空白处点击不会触发 cellClicked，需要在 viewport 上补一次拦截
+        self.table.viewport().installEventFilter(self)
         self.table.doubleClicked.connect(self._on_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
@@ -299,7 +299,6 @@ class EventListWidget(QWidget):
         # 信号接线
         self.btn_select_all.clicked.connect(self.select_all)
         self.btn_invert.clicked.connect(self.invert_selection)
-        self.btn_clear_sel.clicked.connect(self.clear_selection)
         self.btn_delete.clicked.connect(self._emit_delete)
         self.btn_up.clicked.connect(lambda: self._emit_move(-1))
         self.btn_down.clicked.connect(lambda: self._emit_move(1))
@@ -650,9 +649,30 @@ class EventListWidget(QWidget):
     # 交互
     # ==================================================================
     def _on_cell_clicked(self, row: int, column: int) -> None:
+        """单元格点击：复选框列切换该行勾选，其它列一律清空全部勾选。
+
+        勾选是为批量操作服务的临时状态，点到别处就失效——符合「点哪里
+        就只关注哪里」的直觉。正因如此，工具栏不再需要单独的「取消选择」。
+        """
         self.set_focus_row(row)
         if column == COL_CHECK:
             self.toggle_row(row)
+        elif self._checked:
+            self.clear_selection()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        """点击列表空白处（没有命中任何行）时同样清空勾选。
+
+        ``cellClicked`` 只在有效单元格上触发，表格下方留白不会发出信号，
+        所以额外在 viewport 上拦一次鼠标按下。
+        """
+        if (watched is self.table.viewport()
+                and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton
+                and not self.table.indexAt(event.pos()).isValid()
+                and self._checked):
+            self.clear_selection()
+        return super().eventFilter(watched, event)
 
     def _on_double_clicked(self, index) -> None:
         """双击：时间列 -> 编辑步骤（含时间）；其它列 -> 跳步执行。"""
@@ -710,7 +730,6 @@ class EventListWidget(QWidget):
         count = self.checked_count
         self.btn_select_all.setEnabled(has_steps and count < len(self._steps))
         self.btn_invert.setEnabled(has_steps)
-        self.btn_clear_sel.setEnabled(count > 0)
         self.btn_delete.setEnabled(count > 0)
         self.btn_up.setEnabled(count > 0)
         self.btn_down.setEnabled(count > 0)
@@ -730,7 +749,7 @@ class EventListWidget(QWidget):
     def set_editing_enabled(self, enabled: bool) -> None:
         """录制/回放过程中禁用编辑动作，避免中途改到正在执行的数据。"""
         self._editing_enabled = enabled
-        for button in (self.btn_select_all, self.btn_invert, self.btn_clear_sel,
+        for button in (self.btn_select_all, self.btn_invert,
                        self.btn_delete, self.btn_up, self.btn_down,
                        self.btn_insert, self.btn_save,
                        self.btn_duration, self.btn_edit_step):

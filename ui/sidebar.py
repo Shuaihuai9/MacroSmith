@@ -5,7 +5,6 @@
 录制中会显示红色脉冲圆点。
 """
 
-from __future__ import annotations
 
 from PySide6.QtCore import (QEasingCurve, QPointF, QRectF, Qt,
                             QVariantAnimation, Signal)

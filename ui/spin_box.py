@@ -17,7 +17,6 @@ padding-right 完全无效，全写 padding 也不可靠）。在 125%/150% DPI�
 ``setFixedWidth``，调用方基本不用改代码。
 """
 
-from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QRegularExpression, Qt, Signal
 from PySide6.QtGui import QIntValidator, QPainter, QRegularExpressionValidator

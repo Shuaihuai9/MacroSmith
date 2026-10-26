@@ -13,7 +13,6 @@
 重排时间戳由 ``core.event_parser`` 完成。
 """
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
@@ -89,6 +88,9 @@ class StepEdit:
     # ---- 鼠标移动：起始坐标（优化 2）----
     start_x: Optional[int] = None
     start_y: Optional[int] = None
+    # ---- 步间空白间隔（第十一阶段）：None 表示用户没改 ----
+    gap_before_ms: Optional[int] = None   # 与上一步的间隔（毫秒）
+    gap_after_ms: Optional[int] = None    # 与下一步的间隔（毫秒；最后一步无此项）
 
 
 def _int_field(minimum: int, maximum: int, value: int) -> NumberField:
@@ -124,7 +126,9 @@ def _to_physical_point(point: tuple[int, int]) -> tuple[int, int]:
 class _BaseEditDialog(QDialog):
     """编辑对话框基类：统一按钮、预览与主界面同款 QSS。"""
 
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+    def __init__(self, title: str, parent: QWidget | None = None,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
@@ -133,6 +137,12 @@ class _BaseEditDialog(QDialog):
         # 不出现原生 Windows 灰色按钮。
         styles.apply_to_dialog(self)
         self._result: Optional[StepEdit] = None
+        # 步间间隔的初值：None 表示该位置没有间隔可编辑（首步没有「上一步」，
+        # 末步没有「下一步」），此时不显示对应输入框。
+        self._gap_before_ms = gap_before_ms
+        self._gap_after_ms = gap_after_ms
+        self._gap_before_in: Optional[NumberField] = None
+        self._gap_after_in: Optional[NumberField] = None
 
         self._outer = QVBoxLayout(self)
         self._outer.setContentsMargins(18, 16, 18, 16)
@@ -161,6 +171,40 @@ class _BaseEditDialog(QDialog):
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self.reject)
 
+    def _add_gap_rows(self, layout: QFormLayout, box: QWidget) -> None:
+        """在「时间」分组里追加「与上一步 / 与下一步的间隔」两行（单位：秒）。
+
+        只在确实存在相邻步骤时才显示：首步没有「上一步」，末步没有
+        「下一步」；这两处留空即表示「不改」。
+        """
+        for attr, value, label in (
+            ("_gap_before_in", self._gap_before_ms, "与上一步的间隔"),
+            ("_gap_after_in", self._gap_after_ms, "与下一步的间隔"),
+        ):
+            if value is None:
+                continue
+            row = QWidget(box)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            field = NumberField(0, 99999.999, max(0, int(value)) / 1000.0,
+                                row, decimals=3, step=0.1)
+            field.setFixedWidth(90)
+            field.setToolTip("步与步之间的空白等待时间；改大后续步骤整体后移")
+            row_layout.addWidget(field)
+            unit = QLabel("秒", row)
+            unit.setObjectName("Muted")
+            row_layout.addWidget(unit)
+            row_layout.addStretch(1)
+            layout.addRow(label, row)
+            setattr(self, attr, field)
+
+    def _gap_value_ms(self, field: Optional[NumberField]) -> Optional[int]:
+        """读取间隔输入框（秒 → 毫秒），没有该输入框时返回 None。"""
+        if field is None:
+            return None
+        return int(round(field.value() * 1000))
+
     def _finish(self, form: QWidget) -> None:
         """把表单塞进布局并接上按钮（子类构造末尾调用）。"""
         self._outer.addWidget(form)
@@ -181,6 +225,10 @@ class _BaseEditDialog(QDialog):
 
     def _on_accept(self) -> None:
         self._result = self.collect()
+        if self._result is not None:
+            # 间隔改动统一在这里回填，四个子类不需要各自处理
+            self._result.gap_before_ms = self._gap_value_ms(self._gap_before_in)
+            self._result.gap_after_ms = self._gap_value_ms(self._gap_after_in)
         self.accept()
 
     def collect(self) -> StepEdit:  # pragma: no cover - 子类实现
@@ -194,8 +242,11 @@ class MouseStepDialog(_BaseEditDialog):
     （拆分后的步骤带边界标记，不会再被自动合并粘回去）。
     """
 
-    def __init__(self, step: ep.Step, parent: QWidget | None = None) -> None:
-        super().__init__("编辑鼠标步骤", parent)
+    def __init__(self, step: ep.Step, parent: QWidget | None = None,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> None:
+        super().__init__("编辑鼠标步骤", parent,
+                         gap_before_ms=gap_before_ms, gap_after_ms=gap_after_ms)
         self._step = step
 
         first = step.events[0] if step.events else {}
@@ -315,6 +366,8 @@ class MouseStepDialog(_BaseEditDialog):
         d_layout.addStretch(1)
         time_layout.addRow("持续时长", d_row)
 
+        # 步间空白间隔（单位：秒）：与上一步 / 与下一步
+        self._add_gap_rows(time_layout, time_box)
         layout.addRow("", time_box)
 
         # ---------- 高级：长按 + 无限连击 ----------
@@ -523,9 +576,12 @@ class MouseStepDialog(_BaseEditDialog):
 class MoveStepDialog(_BaseEditDialog):
     """鼠标移动 / 滚轮步骤编辑：坐标（滚轮还可改格数）。"""
 
-    def __init__(self, step: ep.Step, parent: QWidget | None = None) -> None:
+    def __init__(self, step: ep.Step, parent: QWidget | None = None,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> None:
         super().__init__("编辑鼠标移动" if step.kind == "move" else "编辑鼠标滚轮",
-                         parent)
+                         parent, gap_before_ms=gap_before_ms,
+                         gap_after_ms=gap_after_ms)
         self._step = step
         first = step.events[0] if step.events else {}
         last = step.events[-1] if step.events else {}
@@ -656,6 +712,8 @@ class MoveStepDialog(_BaseEditDialog):
         d_layout.addStretch(1)
         time_layout.addRow("持续时长", d_row)
 
+        # 步间空白间隔（单位：秒）：与上一步 / 与下一步
+        self._add_gap_rows(time_layout, time_box)
         layout.addRow("", time_box)
 
         self._finish(form)
@@ -712,8 +770,11 @@ class MoveStepDialog(_BaseEditDialog):
 class KeyStepDialog(_BaseEditDialog):
     """键盘步骤编辑：直接按键捕获，或从常用键下拉里选。"""
 
-    def __init__(self, step: ep.Step, parent: QWidget | None = None) -> None:
-        super().__init__("编辑键盘步骤", parent)
+    def __init__(self, step: ep.Step, parent: QWidget | None = None,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> None:
+        super().__init__("编辑键盘步骤", parent,
+                         gap_before_ms=gap_before_ms, gap_after_ms=gap_after_ms)
         self._step = step
         first = step.events[0] if step.events else {}
         token = str(first.get("key") or "vk:65")
@@ -790,6 +851,8 @@ class KeyStepDialog(_BaseEditDialog):
         d_layout.addStretch(1)
         time_layout.addRow("持续时长", d_row)
 
+        # 步间空白间隔（单位：秒）：与上一步 / 与下一步
+        self._add_gap_rows(time_layout, time_box)
         layout.addRow("", time_box)
 
         # ---------- 高级：长按 + 无限连击 ----------
@@ -897,8 +960,11 @@ class KeyStepDialog(_BaseEditDialog):
 class ComboStepDialog(_BaseEditDialog):
     """组合键编辑：勾选修饰键 + 选目标键。"""
 
-    def __init__(self, step: ep.Step, parent: QWidget | None = None) -> None:
-        super().__init__("编辑组合键", parent)
+    def __init__(self, step: ep.Step, parent: QWidget | None = None,
+                 gap_before_ms: Optional[int] = None,
+                 gap_after_ms: Optional[int] = None) -> None:
+        super().__init__("编辑组合键", parent,
+                         gap_before_ms=gap_before_ms, gap_after_ms=gap_after_ms)
         self._step = step
 
         form = QWidget(self)
@@ -984,6 +1050,8 @@ class ComboStepDialog(_BaseEditDialog):
         d_layout.addStretch(1)
         time_layout.addRow("持续时长", d_row)
 
+        # 步间空白间隔（单位：秒）：与上一步 / 与下一步
+        self._add_gap_rows(time_layout, time_box)
         layout.addRow("", time_box)
 
         self._finish(form)
@@ -1024,17 +1092,24 @@ class ComboStepDialog(_BaseEditDialog):
                         duration_ms=int(round(self.spin_duration.value() * 1000)))
 
 
-def edit_step_dialog(step: ep.Step, parent: QWidget | None = None
+def edit_step_dialog(step: ep.Step, parent: QWidget | None = None,
+                     gap_before_ms: Optional[int] = None,
+                     gap_after_ms: Optional[int] = None
                      ) -> Optional[StepEdit]:
-    """按步骤类型弹出对应的编辑对话框；用户取消时返回 ``None``。"""
+    """按步骤类型弹出对应的编辑对话框；用户取消时返回 ``None``。
+
+    ``gap_before_ms`` / ``gap_after_ms`` 是该步骤当前与前后步骤之间的
+    空白间隔（毫秒），``None`` 表示该方向没有相邻步骤、不显示输入框。
+    """
+    gaps = {"gap_before_ms": gap_before_ms, "gap_after_ms": gap_after_ms}
     if step.kind == "combo":
-        dialog: _BaseEditDialog = ComboStepDialog(step, parent)
+        dialog: _BaseEditDialog = ComboStepDialog(step, parent, **gaps)
     elif step.kind in ("click", "multi"):
-        dialog = MouseStepDialog(step, parent)
+        dialog = MouseStepDialog(step, parent, **gaps)
     elif step.kind in ("move", "scroll"):
-        dialog = MoveStepDialog(step, parent)
+        dialog = MoveStepDialog(step, parent, **gaps)
     elif step.kind == "key":
-        dialog = KeyStepDialog(step, parent)
+        dialog = KeyStepDialog(step, parent, **gaps)
     else:  # pragma: no cover - 未知类型
         return None
 

@@ -16,7 +16,6 @@
 （主窗口掌握配置、脏标记与"当前脚本"状态）。
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -61,6 +60,8 @@ class ScriptManagerPage(QWidget):
     delete_requested = Signal()
     #: 「加载该脚本」：把选中脚本载入并准备回放（不再跳转到别的页）
     load_requested = Signal()
+    #: 「释放脚本」：卸载当前已加载脚本，清空预览并禁用回放热键
+    release_requested = Signal()
     refresh_requested = Signal()
     #: 回放控制
     play_requested = Signal()
@@ -73,6 +74,7 @@ class ScriptManagerPage(QWidget):
         self._scripts: list[Path] = []
         self._selected: Optional[Path] = None
         self._playing = False
+        self._has_content = False   # 主窗口按「是否有已加载/录制内容」回写
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(styles.CONTENT_MARGIN, 12, styles.CONTENT_MARGIN,
@@ -193,6 +195,18 @@ class ScriptManagerPage(QWidget):
 
         preview_actions = QHBoxLayout()
         preview_actions.addStretch(1)
+
+        self.btn_release = QPushButton("释放脚本")
+        self.btn_release.setObjectName("SecondaryButton")
+        self.btn_release.setToolTip(
+            "卸载当前已加载的脚本：清空步骤预览与回放内容，"
+            "之后回放/单步热键将不再响应"
+        )
+        self.btn_release.setCursor(Qt.PointingHandCursor)
+        self.btn_release.setEnabled(False)
+        self.btn_release.clicked.connect(self.release_requested.emit)
+        preview_actions.addWidget(self.btn_release)
+
         self.btn_load = QPushButton("加载该脚本")
         self.btn_load.setObjectName("PrimaryButton")
         self.btn_load.setToolTip(
@@ -352,7 +366,7 @@ class ScriptManagerPage(QWidget):
     def set_playing(self, playing: bool, paused: bool = False) -> None:
         """回放状态变化时切换按钮与说明。"""
         self._playing = bool(playing)
-        self.btn_play.setEnabled(not playing)
+        self.btn_play.setEnabled(self._has_content and not self._playing)
         self.btn_stop_play.setEnabled(playing)
         self.btn_play.setText("暂停中" if (playing and paused) else "开始回放")
         if playing:
@@ -377,8 +391,9 @@ class ScriptManagerPage(QWidget):
         )
 
     def set_play_enabled(self, enabled: bool) -> None:
-        """没有可回放内容时禁用开始按钮。"""
-        self.btn_play.setEnabled(enabled and not self._playing)
+        """没有可回放内容时禁用开始按钮（释放脚本后即为该状态）。"""
+        self._has_content = bool(enabled)
+        self.btn_play.setEnabled(self._has_content and not self._playing)
 
     # ==================================================================
     # 构建辅助
@@ -573,7 +588,7 @@ class ScriptManagerPage(QWidget):
         self.btn_delete.setEnabled(has_selection)
         self.btn_load.setEnabled(has_selection)
         # 有选中脚本才能「加载该脚本」；能否回放由主窗口按内容再判定
-        self.btn_play.setEnabled(has_selection and not self._playing)
+        self.btn_play.setEnabled(self._has_content and not self._playing)
 
     def select_path(self, path: Path) -> None:
         """按路径选中某一行（用于新建/重命名后定位）。"""

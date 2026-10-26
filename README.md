@@ -7,7 +7,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB)
 ![Qt](https://img.shields.io/badge/GUI-PySide6-41CD52)
-![Version](https://img.shields.io/badge/version-1.0.0-4A6CF7)
+![Version](https://img.shields.io/badge/version-1.1.0-4A6CF7)
 
 ---
 
@@ -32,6 +32,8 @@
 - 移动抖动自动过滤；同坐标的冗余移动帧自动剔除
 - 停止录制热键（F9）不会被录进脚本
 - 录制结束自动补齐「按下未释放」的按键，回放不卡键
+- **腾讯系平台兼容**：前台是 WeGame / QQ 游戏大厅等平台时，自动切换到轮询采集通道（其反作弊驱动会过滤常规键鼠钩子），离开后自动切回，无需手动设置
+- **需要管理员权限**：上述平台的进程完整性级别较高，普通权限下只能录到鼠标移动、录不到点击与键盘。`start.bat` 会自动申请提权，安装版 exe 自带管理员清单（双击后确认 UAC 即可）
 
 ### 步骤编辑器
 
@@ -42,6 +44,8 @@
   - 移动：目标坐标、持续时长（秒），插入的移动自动补中间帧，回放平滑
   - 滚轮：滚动量与坐标（带屏幕取点）
 - 时间单位统一为秒，单步时间与整段总时长均可重排
+- **步间间隔可编辑**：单步编辑里可单独调整「与上一步 / 与下一步」的空白间隔，后续时间戳自动顺延，不会重叠或出现负数
+- **重设总时长**支持目标时长 + 平均步间间隔 + 间隔随机浮动（± 秒），节奏更接近真人操作
 - 编辑后时间戳自动重排，保存即写回 JSON
 
 ### 智能合并
@@ -70,7 +74,9 @@
 
 - Per-Monitor DPI 感知，高分屏下录制与回放坐标一致
 - 窗口尺寸、位置、所有设置自动持久化
-- 未保存改动有切换/覆盖保护
+- 未保存改动有切换/覆盖保护，并在状态栏高亮「未保存」；关闭窗口可选「保存并退出 / 直接退出 / 取消」
+- 「释放脚本」一键清空当前加载内容；未加载脚本时回放热键不响应
+- 脚本选择为纯下拉框，「打开脚本文件」直接打开脚本所在文件夹
 - 单实例运行，不会同时启动两个
 
 ---
@@ -185,21 +191,34 @@ MacroSmith/
 - [PySide6](https://www.qt.io/qt-for-python) —— 界面框架
 - [pynput](https://github.com/moses-palmer/pynput) —— 键鼠监听与模拟
 - ctypes / Win32 API —— 低级键盘钩子、DPI 感知、单实例互斥
-- [PyInstaller](https://pyinstaller.org/) + [Inno Setup](https://jrsoftware.org/isinfo.php) —— 打包与安装程序
+- [Nuitka](https://nuitka.net/) + [Inno Setup](https://jrsoftware.org/isinfo.php) —— 打包（机器码，无 `.py` / `.pyc`）与安装程序
 
 ---
 
 ## 自行打包
 
 ```powershell
-# 1) 构建 onedir 产物到 dist\MacroSmith\
-python -m PyInstaller MacroSmith.spec --noconfirm
+# 1) Nuitka 编译（需 Python 3.13 + Nuitka 4.2.1 + PySide6 6.8.x，版本见 requirements.txt）
+.\build_nuitka.bat
 
 # 2) （需自行安装 Inno Setup 6）编译安装包
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\MacroSmith.iss
 ```
 
+Nuitka 产物在 `build_nuitka\main.dist\`，需对齐到 `dist\MacroSmith\`（安装脚本按此路径读取），安装包输出到 `installer\Output\`。
+
+> 版本锁定不要随意升级：Nuitka 4.3.x / PySide6 6.11.x 存在 Qt 子类创建段错误的回归问题。
+> 打包产物自带管理员清单（`--windows-uac-admin`），双击即申请提权。
+
 安装包输出到 `installer\Output\`。打包后配置与脚本自动切换到 `%APPDATA%\MacroSmith\`，发布包不含任何用户脚本。
+
+---
+
+## 已知限制
+
+- **腾讯系游戏的游戏本体不受支持**：大厅 / 登录器界面可以正常录制（需管理员权限），但进入受反作弊保护的游戏本体后，键鼠注入会被内核驱动过滤，回放可能无效，也可能被判定为异常操作，请自行评估风险
+- **受保护窗口内录不到滚轮**：滚轮没有可轮询的状态接口，兼容通道只覆盖移动、点击与键盘
+- **按住型操作依赖管理员权限**：普通权限下对高完整性级别窗口只能录到鼠标移动
 
 ---
 

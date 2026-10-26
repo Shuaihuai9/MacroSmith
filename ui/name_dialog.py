@@ -5,7 +5,6 @@
 与本项目的现代极简风格不统一。
 """
 
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional

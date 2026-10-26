@@ -22,7 +22,6 @@
 ``body`` / ``content_host`` 这套既有接口，主窗口无需大改）。
 """
 
-from __future__ import annotations
 
 from PySide6.QtCore import QSize
 from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget

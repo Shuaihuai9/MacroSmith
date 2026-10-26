@@ -5,7 +5,6 @@
 :class:`core.hotkey_manager.HotkeyManager` 重新注册。
 """
 
-from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent

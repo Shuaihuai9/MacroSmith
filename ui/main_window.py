@@ -13,7 +13,7 @@
 
 
 import logging
-import time
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -43,7 +43,7 @@ from utils.win_utils import WINDOW_TITLE, ensure_dir, is_admin
 
 log = logging.getLogger(__name__)
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 #: 内容区页面下标
 #: 页面下标。第六阶段把「脚本库」上移为第一页并改名为「回放与脚本」：
@@ -57,39 +57,6 @@ PAGE_LIBRARY = PAGE_SCRIPTS
 
 #: 按钮内图标尺寸
 _TOOL_ICON_SIZE = QSize(15, 15)
-
-
-class _ScriptComboBox(QComboBox):
-    """记录「下拉列表是否刚被用户操作过」的可编辑下拉框。
-
-    可编辑 QComboBox 有个坑：**焦点离开**时会把文本框内容当作一次
-    "选择"并发射 ``activated`` —— 用户点侧边栏切换页面时就会误触发
-    「加载脚本 + 跳回录制页」。
-
-    用 ``_user_picked`` flag 区分「用户真在列表里点选了一项」与
-    「焦点离开引起的伪激活」：hidePopup 在下拉列表确实打开过时置
-    True，activated 消费后清除；若用户关掉下拉框但不选项，
-    QTimer.singleShot(0) 在下一个事件循环周期清除 flag，避免后续
-    伪 activated 误触发。
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.last_popup_hide = 0.0
-        self._user_picked = False
-
-    def hidePopup(self) -> None:  # noqa: N802 - Qt 命名
-        was_open = self.view() is not None and self.view().isVisible()
-        super().hidePopup()
-        if was_open:
-            self.last_popup_hide = time.monotonic()
-            self._user_picked = True
-            # 若用户关掉下拉框但不选项（activated 不会发射），
-            # 在下一个事件循环清除 flag，防止后续伪 activated 误触发
-            QTimer.singleShot(0, self._clear_user_picked)
-
-    def _clear_user_picked(self) -> None:
-        self._user_picked = False
 
 
 class State(Enum):
@@ -260,24 +227,19 @@ class MainWindow(WindowShell):
         script_icon.setStyleSheet("background: transparent;")
         title_row.addWidget(script_icon)
 
-        self.script_name_edit = _ScriptComboBox(page)
-        self.script_name_edit.setEditable(True)
-        self.script_name_edit.setInsertPolicy(QComboBox.NoInsert)
+        self.script_name_edit = QComboBox(page)
+        # 纯下拉选择：不再允许直接输入名称（重命名走「新建脚本」/另存为）
+        self.script_name_edit.setEditable(False)
         self.script_name_edit.setMinimumWidth(220)
         self.script_name_edit.setMinimumHeight(30)
         self.script_name_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.script_name_edit.lineEdit().setPlaceholderText("脚本名称（留空则按时间自动命名）")
-        self.script_name_edit.setToolTip(
-            "可直接输入脚本名称，也可以下拉选择历史脚本：\n"
-            "· 输入名称 → 保存时按该名称写入脚本目录\n"
-            "· 下拉选择 → 立即载入那个脚本"
-        )
-        self.script_name_edit.setCurrentText(self._default_script_name())
-        self.script_name_edit.editTextChanged.connect(self._on_script_name_edited)
+        # 未选中任何脚本时（新录制 / 已释放）显示占位文字；
+        # 不可编辑的 QComboBox 点击整块区域（含文字部分）都会展开下拉列表
+        self.script_name_edit.setPlaceholderText("未加载脚本")
+        self.script_name_edit.setToolTip("点击下拉选择历史脚本，加载到当前界面。")
+        # 当前脚本名单独保存：纯下拉框无法显示不在列表里的名称
+        self._script_name = self._default_script_name()
         self.script_name_edit.activated.connect(self._on_script_combo_activated)
-        self.script_name_edit.lineEdit().textEdited.connect(self._on_script_name_typed)
-        self._combo_guard = False       # 程序刷新下拉项/回填名称时抑制副作用
-        self._combo_user_typed = False  # 用户手输过名称（回车提交算有效激活）
         title_row.addWidget(self.script_name_edit, 1)
 
         # 「新建脚本」：与下拉框并列的显式入口
@@ -318,8 +280,9 @@ class MainWindow(WindowShell):
             button_row.addWidget(btn)
         button_row.addStretch(1)
 
-        self.btn_load = QPushButton("打开脚本", page)
+        self.btn_load = QPushButton("打开脚本文件", page)
         self.btn_load.setObjectName("SecondaryButton")
+        self.btn_load.setToolTip("在资源管理器中打开脚本存放文件夹")
         self.btn_save_as = QPushButton("另存为…", page)
         self.btn_save_as.setObjectName("SecondaryButton")
         self.btn_clear = QPushButton("清空", page)
@@ -366,6 +329,14 @@ class MainWindow(WindowShell):
         self.step_label = QLabel("步骤 0 / 0")
         self.step_label.setObjectName("StepProgress")
         line1.addWidget(self.step_label)
+
+        # 「未保存」提示：与「步骤 X / X」共用同一套样式（强调色 + 600 字重），
+        # 保证同样醒目；仅在 is_dirty 为真时显示，保存后自动隐藏。
+        self.dirty_label = QLabel("未保存")
+        self.dirty_label.setObjectName("StepProgress")
+        self.dirty_label.setToolTip("当前脚本有尚未写回磁盘的修改")
+        self.dirty_label.setVisible(False)
+        line1.addWidget(self.dirty_label)
 
         self.loop_label = QLabel("")
         self.loop_label.setObjectName("Badge")
@@ -486,7 +457,7 @@ class MainWindow(WindowShell):
         self.btn_start_play.clicked.connect(self.start_replay)
         self.btn_stop_play.clicked.connect(self.stop_replay)
         self.btn_reset_step.clicked.connect(self.reset_step_pointer)
-        self.btn_load.clicked.connect(self.load_script_dialog)
+        self.btn_load.clicked.connect(self.open_script_folder)
         self.btn_save_as.clicked.connect(self.save_script_as)
         self.btn_clear.clicked.connect(self.clear_events)
         self.btn_new_script.clicked.connect(self.create_script)
@@ -502,6 +473,7 @@ class MainWindow(WindowShell):
         self.page_library.rename_requested.connect(self.rename_selected_script)
         self.page_library.delete_requested.connect(self.delete_selected_script)
         self.page_library.load_requested.connect(self.load_selected_script)
+        self.page_library.release_requested.connect(self.release_script)
         self.page_library.refresh_requested.connect(self.refresh_script_library)
         self.page_library.play_requested.connect(self.start_replay)
         self.page_library.stop_play_requested.connect(self.stop_replay)
@@ -617,6 +589,11 @@ class MainWindow(WindowShell):
             if self.state is State.RECORDING:
                 self.stop_recording()
             return
+        # 已释放脚本（或从未加载）时，回放与单步热键一律静默忽略
+        if action in ("play_toggle", "pause_toggle", "play_stop",
+                      "step_next", "step_prev", "step_reset"):
+            if not self._current_events():
+                return
         if action == "play_toggle":
             if self.state is State.RECORDING:
                 return
@@ -664,9 +641,13 @@ class MainWindow(WindowShell):
     # 录制
     # ==================================================================
     def start_recording(self) -> None:
-        """开始录制。"""
+        """开始录制。已有脚本内容时先确认覆盖，避免录到一半才发现丢数据。"""
         if not self._ensure_mode(MODE_TIMED, "开始录制"):
             return
+        # 提前拦截：已加载脚本 / 内存中已有步骤时，先问清楚再覆盖
+        if self._current_events() or self._current_script is not None:
+            if not self._confirm_replace_for_record():
+                return
         player = self.config.get("player", {}) or {}
         ok = self.recorder.start(
             min_interval_ms=int(player.get("move_min_interval_ms", 50)),
@@ -699,7 +680,7 @@ class MainWindow(WindowShell):
         self._script_steps = []
         self._current_script = None
         self.player.clear()
-        self._unsaved = False
+        self.is_dirty = False
         self._pending_records.clear()
         self._record_timer.start()
         self._set_message(
@@ -741,9 +722,9 @@ class MainWindow(WindowShell):
             events = list(self._script_events)
         self._script_events = list(events)
         self._script_steps = self._build_steps(self._script_events)
-        self.player.load(self._script_events, self.script_name_edit.currentText().strip())
+        self.player.load(self._script_events, self.script_name())
         self.event_list.set_steps(self._script_steps)
-        self._unsaved = bool(self._script_events)
+        self.is_dirty = bool(self._script_events)
         self._set_state(State.IDLE)
         self._refresh_status()
 
@@ -798,7 +779,7 @@ class MainWindow(WindowShell):
             self._refresh_status()
             return
 
-        self.player.load(events, self.script_name_edit.currentText().strip())
+        self.player.load(events, self.script_name())
         self.player.speed = float(self.config.get("player.speed", 1.0) or 1.0)
         # 循环设置来自配置（界面上的下拉框会写回配置）
         self.player.set_loop(self.config.loop_mode, self.config.loop_count)
@@ -968,7 +949,7 @@ class MainWindow(WindowShell):
             return
         if (len(self.player.steps) != len(self._script_steps)
                 or self.player.events != events):
-            self.player.load(events, self.script_name_edit.currentText().strip())
+            self.player.load(events, self.script_name())
 
     def _refresh_step_view(self) -> None:
         """刷新步骤进度与高亮。
@@ -1069,7 +1050,15 @@ class MainWindow(WindowShell):
             self._set_message(f"暂不支持编辑「{step.kind_label}」类型的步骤。")
             return
 
-        edit = edit_step_dialog(step, self)
+        # 步间空白间隔（任务 2）：交给弹窗预填「与上一步 / 与下一步的间隔」。
+        # 首步没有上一步、末步没有下一步，对应位置传 None 表示不可编辑
+        # （最后一步之后本来就不需要间隔）。
+        gaps = ep.step_gaps(self._script_steps)
+        prev_gap = gaps[row] if row > 0 else None
+        next_gap = gaps[row + 1] if row + 1 < len(gaps) else None
+
+        edit = edit_step_dialog(step, self,
+                                gap_before_ms=prev_gap, gap_after_ms=next_gap)
         if edit is None:
             return
 
@@ -1135,6 +1124,26 @@ class MainWindow(WindowShell):
         if edit.start_ms is not None and edit.start_ms != current_step.t_start:
             try:
                 events = ep.set_step_time(self._script_events, row, edit.start_ms)
+            except ep.StepEditError as exc:
+                self._set_message(str(exc))
+                return
+            self._set_steps(events, self._build_steps(events), [row])
+
+        # ---- 第四步：调整步间间隔（任务 2 / 任务 4：手动修改优先）----
+        # 只处理用户真正改过的方向；保持「动作时长」与「空白间隔」互不干扰。
+        current_gaps = ep.step_gaps(self._script_steps)
+        want_before = (edit.gap_before_ms
+                       if (edit.gap_before_ms is not None and row > 0
+                           and edit.gap_before_ms != current_gaps[row]) else None)
+        want_after = (edit.gap_after_ms
+                      if (edit.gap_after_ms is not None
+                          and row + 1 < len(current_gaps)
+                          and edit.gap_after_ms != current_gaps[row + 1]) else None)
+        if want_before is not None or want_after is not None:
+            try:
+                events = ep.set_step_gap(self._script_events, row,
+                                         gap_before_ms=want_before,
+                                         gap_after_ms=want_after)
             except ep.StepEditError as exc:
                 self._set_message(str(exc))
                 return
@@ -1213,12 +1222,12 @@ class MainWindow(WindowShell):
         """
         self._script_events = list(events)
         self._script_steps = list(steps)
-        self.player.load(self._script_events, self.script_name_edit.currentText().strip())
+        self.player.load(self._script_events, self.script_name())
         self.event_list.set_steps(self._script_steps)
         if keep_checked:
             self.event_list.set_checked(keep_checked)
         self.event_list.highlight(-1)
-        self._unsaved = True
+        self.is_dirty = True
         self._set_state(self.state)
 
     def apply_steps(self, events: list[dict[str, Any]],
@@ -1230,10 +1239,10 @@ class MainWindow(WindowShell):
         steps = self._build_steps(events)
         self._script_events = list(events)
         self._script_steps = list(steps)
-        self.player.load(self._script_events, self.script_name_edit.currentText().strip())
+        self.player.load(self._script_events, self.script_name())
         self.event_list.set_steps(self._script_steps)
         self.event_list.highlight(-1)
-        self._unsaved = mark_unsaved
+        self.is_dirty = mark_unsaved
         self._set_state(self.state)
 
     def insert_step_at(self, position: int) -> None:
@@ -1299,7 +1308,7 @@ class MainWindow(WindowShell):
     # 时间列双击与右键「编辑这一步」统一走 edit_step_params。
 
     def reset_total_duration(self) -> None:
-        """弹窗输入目标总时长，把整段脚本的步骤均匀重排。"""
+        """弹窗输入目标总时长 / 平均间隔 / 随机浮动，重新分配整段脚本的时间轴。"""
         if self.state is State.RECORDING:
             self._set_message("正在录制中，无法重设总时长。")
             return
@@ -1311,15 +1320,27 @@ class MainWindow(WindowShell):
             return
 
         current = ep.events_duration_ms(self._script_events)
-        target = ask_total_duration(current, len(self._script_steps), self)
-        if target is None:
+        result = ask_total_duration(current, len(self._script_steps), self)
+        if result is None:
             return
-        events = ep.redistribute_duration(self._script_events, target)
+        # 兼容只返回目标时长的旧调用形态（测试里有 monkeypatch 直接返回 int）
+        if isinstance(result, int):
+            target, avg_gap, jitter = result, 0, 0
+        else:
+            target, avg_gap, jitter = result
+        # 任务 4：全局重设会覆盖之前手动改过的间隔（按新算法暴力重排）
+        events = ep.redistribute_duration(
+            self._script_events, target, avg_gap_ms=avg_gap, jitter_ms=jitter)
         self._set_steps(events, self._build_steps(events), [])
+        extra = ""
+        if avg_gap > 0:
+            extra = f"，固定间隔 {avg_gap / 1000:.3f} 秒"
+        if jitter > 0:
+            extra += f"（随机浮动 ±{jitter / 1000:.3f} 秒）"
         self._set_message(
             f"已把 {len(self._script_steps)} 个步骤均匀铺开到 "
             f"{ep.format_duration(ep.events_duration_ms(events))}"
-            f"（原 {ep.format_duration(current)}），可点「保存修改」写回脚本。"
+            f"（原 {ep.format_duration(current)}{extra}），可点「保存」写回脚本。"
         )
 
     def save_edited_steps(self) -> Optional[Path]:
@@ -1371,14 +1392,16 @@ class MainWindow(WindowShell):
             return None
         if ask_overwrite and not self._confirm_overwrite(Path(path)):
             return None
-        name = self.script_name_edit.currentText().strip() or path.stem
+        name = self.script_name() or path.stem
         try:
             saved = ep.save_script(path, name, events)
         except ep.ScriptError as exc:
             self._on_error(str(exc))
             return None
         self._current_script = saved
-        self._unsaved = False
+        self.is_dirty = False
+        # 保存后文件名可能被清洗过（非法字符），以磁盘上的名字为准
+        self.set_script_name(saved.stem, mark_dirty=False)
         self.config.set("last_script", str(saved))
         self.config.save()
         self.refresh_script_library()
@@ -1396,8 +1419,8 @@ class MainWindow(WindowShell):
             if not silent:
                 self._set_message("没有可保存的内容，请先录制。")
             return None
-        name = self.script_name_edit.currentText().strip() or self._default_script_name()
-        # 这里只是把补全后的名字回填到输入框，不能因此把脚本标记成「已修改」
+        name = self.script_name() or self._default_script_name()
+        # 这里只是把补全后的名字回填到下拉框，不能因此把脚本标记成「已修改」
         self.set_script_name(name, mark_dirty=False)
         target = ensure_dir(self.config.scripts_path()) / (_safe_filename(name) + ".json")
         return self._save_to_path(target, silent=silent, ask_overwrite=True)
@@ -1409,7 +1432,7 @@ class MainWindow(WindowShell):
             self._set_message("没有可保存的内容，请先录制。")
             return
         start_dir = str(self.config.scripts_path())
-        default_name = _safe_filename(self.script_name_edit.currentText().strip()
+        default_name = _safe_filename(self.script_name()
                                       or self._default_script_name()) + ".json"
         path_str, _filter = QFileDialog.getSaveFileName(
             self, "另存为脚本", str(Path(start_dir) / default_name), "MacroSmith 脚本 (*.json)"
@@ -1418,18 +1441,26 @@ class MainWindow(WindowShell):
             return
         self._save_to_path(Path(path_str), ask_overwrite=True)
 
-    def load_script_dialog(self) -> None:
-        """从磁盘载入脚本 JSON。"""
-        if self.state is State.RECORDING:
-            self._set_message("正在录制中，无法载入脚本。")
+    def open_script_folder(self) -> None:
+        """在资源管理器中打开脚本存放文件夹。
+
+        打包后是 ``%APPDATA%\\MacroSmith\\scripts``，开发环境是
+        ``data/scripts``，由 :meth:`Config.scripts_path` 统一决定；
+        目录不存在时先建出来，避免资源管理器弹「找不到」。
+        """
+        folder = ensure_dir(self.config.scripts_path()).resolve()
+        try:
+            os.startfile(str(folder))
+        except OSError as exc:
+            log.warning("打开脚本文件夹失败：%s", exc)
+            QMessageBox.warning(
+                self, "打开失败",
+                "无法打开脚本文件夹：\n"
+                f"{folder}\n\n{exc}\n\n"
+                "可以复制上面这段路径，粘贴到资源管理器的地址栏打开。",
+            )
             return
-        start_dir = str(self.config.scripts_path())
-        path_str, _filter = QFileDialog.getOpenFileName(
-            self, "载入脚本", start_dir, "MacroSmith 脚本 (*.json);;所有文件 (*)"
-        )
-        if not path_str:
-            return
-        self.load_script_file(Path(path_str))
+        self._set_message(f"已打开脚本文件夹：{folder}")
 
     def load_script_file(self, path: Path) -> Optional[Path]:
         """载入指定脚本文件并刷新界面。成功返回路径，失败返回 None。"""
@@ -1446,7 +1477,7 @@ class MainWindow(WindowShell):
         self.event_list.set_steps(self._script_steps)
         self.set_script_name(name, mark_dirty=False)
         self._current_script = Path(path)
-        self._unsaved = False
+        self.is_dirty = False
         self.config.set("last_script", str(path))
         self.config.save()
         duration = ep.events_duration_ms(self._script_events) / 1000.0
@@ -1463,7 +1494,7 @@ class MainWindow(WindowShell):
         if self.state is State.RECORDING:
             self._set_message("正在录制中，无法清空。")
             return
-        if self._current_events() and self._unsaved:
+        if self._current_events() and self.is_dirty:
             answer = QMessageBox.question(
                 self, "清空步骤",
                 "当前内容尚未保存，确定要清空吗？",
@@ -1476,10 +1507,36 @@ class MainWindow(WindowShell):
         self._script_events = []
         self._script_steps = []
         self._current_script = None
-        self._unsaved = False
+        self.is_dirty = False
         self._set_message("已清空步骤列表。")
         # 内容清空后“开始回放”等按钮要变成禁用
         self._set_state(self.state)
+
+    def release_script(self) -> None:
+        """「释放脚本」：卸载当前脚本，回到“未加载脚本”状态。
+
+        与「清空步骤」的区别：释放不涉及未保存提示，且会把脚本名一起清掉，
+        回放/单步热键在释放后不再响应（见 :meth:`_on_hotkey_action`）。
+        """
+        if self.state is State.RECORDING:
+            self._set_message("正在录制中，无法释放脚本。")
+            return
+        if self.state in (State.REPLAYING, State.PAUSED):
+            self.stop_replay()
+        if not (self._current_events() or self._current_script):
+            self._set_message("当前没有已加载的脚本，无需释放。")
+            return
+
+        self._pending_highlights.clear()
+        self.player.clear()
+        self.event_list.clear()
+        self._script_events = []
+        self._script_steps = []
+        self._current_script = None
+        self.is_dirty = False
+        self.set_script_name("", mark_dirty=False)
+        self._set_state(State.IDLE)
+        self._set_message("已释放脚本：当前未加载脚本，回放与单步热键已禁用。")
 
     # ==================================================================
     # 脚本库
@@ -1503,35 +1560,17 @@ class MainWindow(WindowShell):
         if paths is None:
             paths = ep.list_scripts(self.config.scripts_path())
 
-        self._combo_guard = True
-        try:
-            current = combo.currentText().strip()
-            combo.clear()
-            names = [p.stem for p in paths]
-            for path in paths:
-                combo.addItem(path.stem, str(path))
-            # 正在编辑的名称不在列表里时也保留下来（用户可能想「另存为」）
-            if current and current not in names:
-                combo.insertItem(0, current, None)
-            combo.setCurrentText(current)
-        finally:
-            self._combo_guard = False
-            self._combo_user_typed = False
+        combo.clear()
+        for path in paths:
+            combo.addItem(path.stem, str(path))
+        # 选中当前脚本；名称不在列表里（如新录制尚未保存）则回到占位状态
+        self._sync_script_combo_text()
 
     def _on_script_combo_activated(self, index: int) -> None:
         """用户从下拉框里选了一个历史脚本：立即载入到主界面。"""
-        if getattr(self, "_combo_guard", False) or index < 0:
+        if index < 0:
             return
         combo = self.script_name_edit
-        # 过滤伪激活：只有「下拉列表刚关闭」（用户在列表里点选）或
-        # 「手输后回车」才算真实选择，其余一律回滚文本、不加载。
-        picked = getattr(combo, "_user_picked", False)
-        combo._user_picked = False  # 消费 flag
-        typed = getattr(self, "_combo_user_typed", False)
-        if not (picked or typed):
-            self._sync_script_combo_text()
-            return
-        self._combo_user_typed = False
         path_str = combo.itemData(index)
         if not path_str:
             return
@@ -1548,49 +1587,33 @@ class MainWindow(WindowShell):
             )
 
     def _sync_script_combo_text(self) -> None:
-        """把下拉框文本同步成「当前脚本名」（取消选择后回滚显示用）。"""
+        """把下拉框的选中项同步成「当前脚本名」。
+
+        纯下拉框没有「文本」，只能用选中下标表示：名称不在列表里时置 -1，
+        由占位文字提示「未加载脚本」。
+        """
         combo = getattr(self, "script_name_edit", None)
         if combo is None:
             return
         name = (self._current_script.stem if self._current_script is not None
-                else combo.currentText().strip())
-        self._combo_guard = True
-        try:
-            combo.setCurrentText(name)
-        finally:
-            self._combo_guard = False
-            self._combo_user_typed = False
+                else self._script_name)
+        index = combo.findText(name) if name else -1
+        combo.setCurrentIndex(index)
 
     def script_name(self) -> str:
-        """当前脚本名称（下拉框可编辑部分的文本，已去空白）。"""
-        return self.script_name_edit.currentText().strip()
-
-    def _on_script_name_edited(self, _text: str) -> None:
-        """用户手动改了脚本名：置脏标记（程序回填时由 ``_combo_guard`` 抑制）。"""
-        if getattr(self, "_combo_guard", False):
-            return
-        self._mark_unsaved(True)
-
-    def _on_script_name_typed(self, _text: str) -> None:
-        """用户手输了脚本名：标记为真实输入（回车提交时视为有效激活）。"""
-        self._combo_user_typed = True
+        """当前脚本名称（已去空白）。"""
+        return self._script_name.strip()
 
     def set_script_name(self, name: str, mark_dirty: bool = True) -> None:
-        """设置脚本名称。
+        """设置当前脚本名并同步下拉框选中项。
 
         ``mark_dirty=False`` 用于「载入脚本 / 保存后回填」这类不该产生
-        未保存标记的场景 —— QComboBox 内部是 QLineEdit，
-        ``combo.blockSignals()`` 挡不住 ``editTextChanged``，必须用守卫标志。
+        未保存标记的场景。
         """
-        combo = self.script_name_edit
-        self._combo_guard = True
-        try:
-            combo.setCurrentText(str(name))
-        finally:
-            self._combo_guard = False
-            self._combo_user_typed = False
+        self._script_name = str(name)
+        self._sync_script_combo_text()
         if mark_dirty:
-            self._mark_unsaved(True)
+            self.is_dirty = True
 
     def load_selected_script(self) -> None:
         """「加载该脚本」：把选中的脚本载入并准备回放（停留在本页）。
@@ -1814,7 +1837,7 @@ class MainWindow(WindowShell):
         steps = self._build_steps(events)
         self._script_events = events
         self._script_steps = steps
-        self.player.load(self._script_events, self.script_name_edit.currentText().strip())
+        self.player.load(self._script_events, self.script_name())
         self.event_list.set_steps(self._script_steps)
         self.event_list.highlight(-1)
         self._set_state(self.state)
@@ -1902,7 +1925,7 @@ class MainWindow(WindowShell):
         self.btn_clear.setEnabled(editing)
         self.script_name_edit.setEnabled(editing)
         self.btn_save_as.setEnabled(editing)
-        self.btn_load.setEnabled(editing)
+        # 「打开脚本文件」只是打开文件夹，录制/回放中都保持可用
         self.btn_new_script.setEnabled(editing)
         # 回放/录制过程中禁用步骤编辑，避免改到正在执行的数据
         self.event_list.set_editing_enabled(editing)
@@ -1910,6 +1933,8 @@ class MainWindow(WindowShell):
         self.page_library.btn_rename.setEnabled(editing and self.page_library.selected_path() is not None)
         self.page_library.btn_delete.setEnabled(editing and self.page_library.selected_path() is not None)
         self.page_library.btn_load.setEnabled(editing and self.page_library.selected_path() is not None)
+        # 「释放脚本」只在确实有已加载内容时可用
+        self.page_library.btn_release.setEnabled(editing and has_content)
 
         self.sidebar.set_recording(recording)
         if recording:
@@ -1952,11 +1977,16 @@ class MainWindow(WindowShell):
         duration = ep.events_duration_ms(events) / 1000.0
         self.event_count_label.setText(
             f"{len(events)} 条事件 · {total} 步 · 时长 {duration:.2f}s"
-            + ("　·　未保存" if self._unsaved else "")
         )
+        # 初始化早期状态栏可能还没建完，取不到就跳过
+        dirty_label = getattr(self, "dirty_label", None)
+        if dirty_label is not None:
+            dirty_label.setVisible(self.is_dirty)
         # 「回放与脚本」页的镜像状态
         self.page_library.set_playing(self.state in (State.REPLAYING, State.PAUSED),
                                       self.state is State.PAUSED)
+        # set_playing 会无条件启用开始按钮，这里按“是否还有内容”再收一次
+        self.page_library.set_play_enabled(bool(events))
         self.page_library.set_round(round_text)
         self.page_library.set_current_script(
             self._current_script.name if self._current_script else "",
@@ -2007,7 +2037,41 @@ class MainWindow(WindowShell):
         return list(self._script_events)
 
     def _mark_unsaved(self, unsaved: bool) -> None:
-        self._unsaved = unsaved
+        """旧入口，统一转给 :attr:`is_dirty`（会顺带刷新状态栏）。"""
+        self.is_dirty = unsaved
+
+    @property
+    def is_dirty(self) -> bool:
+        """当前脚本是否有尚未写回磁盘的修改（录制/编辑/增删移/改时间都会置真）。"""
+        return self._unsaved
+
+    @is_dirty.setter
+    def is_dirty(self, value: bool) -> None:
+        value = bool(value)
+        if value == self._unsaved:
+            return
+        self._unsaved = value
+        # 只改一处状态变量，状态栏的「未保存」提示随之刷新
+        self._refresh_status()
+
+    def _confirm_replace_for_record(self) -> bool:
+        """「开始录制」前的覆盖确认。
+
+        旧的流程是等录制结束点「保存」时才提示覆盖，录了半天才发现要重来；
+        现在一旦已有内容就先问清楚，确认后才清空并开始。
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("开始新录制")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("当前已有脚本内容，开始新录制将覆盖现有步骤，是否继续？")
+        confirm = box.addButton("继续录制", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(confirm)
+        box.exec()
+        if box.clickedButton() is not confirm:
+            self._set_message("已取消录制，当前步骤保持不变。")
+            return False
+        return True
 
     def _confirm_discard_unsaved(self, action: str) -> bool:
         """有未保存修改时先征求用户同意（切脚本 / 新建 / 清空前调用）。
@@ -2074,7 +2138,7 @@ class MainWindow(WindowShell):
             self._script_steps = self._build_steps(self._script_events)
             self.event_list.set_steps(self._script_steps)
             self.event_list.highlight(-1)
-            self._unsaved = True
+            self.is_dirty = True
             self.event_count_label.setText(
                 f"正在录制：{len(self._script_events)} 条事件 / {len(self._script_steps)} 步"
             )
@@ -2196,21 +2260,28 @@ class MainWindow(WindowShell):
             self.stop_recording()
         if self.state in (State.REPLAYING, State.PAUSED):
             self.stop_replay()
-        if self._unsaved and self._current_events():
-            answer = QMessageBox.question(
-                self, "退出 宏匠",
-                "当前步骤尚未保存，退出前要保存吗？",
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Save,
-            )
-            if answer == QMessageBox.Cancel:
+        if self.is_dirty and self._current_events():
+            box = QMessageBox(self)
+            box.setWindowTitle("退出 宏匠")
+            box.setIcon(QMessageBox.Question)
+            box.setText("当前有未保存的修改，是否保存后退出？")
+            save_btn = box.addButton("保存并退出", QMessageBox.AcceptRole)
+            discard_btn = box.addButton("直接退出", QMessageBox.DestructiveRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.setDefaultButton(save_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is save_btn:
+                saved = (self._save_to_path(self._current_script, silent=True)
+                         if self._current_script is not None
+                         else self.save_script(silent=True))
+                if saved is None:
+                    # 保存失败或用户在命名弹窗里取消：留在程序里，不丢数据
+                    event.ignore()
+                    return
+            elif clicked is not discard_btn:
                 event.ignore()
                 return
-            if answer == QMessageBox.Save:
-                if self._current_script is not None:
-                    self._save_to_path(self._current_script, silent=True)
-                else:
-                    self.save_script(silent=True)
         try:
             self.hotkeys.stop()
         except Exception:  # pragma: no cover

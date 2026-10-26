@@ -8,7 +8,6 @@
 避免用户手写奇怪的时间字符串。
 """
 
-from __future__ import annotations
 
 from typing import Optional
 
@@ -72,6 +71,8 @@ class _TimeInputDialog(QDialog):
         self.spin_min = NumberField(0, 999, 0)
         self.spin_sec = NumberField(0, 59, 0)
         self.spin_ms = NumberField(0, 999, 0)
+        # 子类（如「重设总时长」）需要继续往这个表单里加行
+        self.form = form
 
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -330,22 +331,80 @@ class StepTimeDialog(QDialog):
 
 
 class DurationDialog(_TimeInputDialog):
-    """重设整个脚本的总时长。"""
+    """重设整个脚本的总时长（含平均步间间隔与随机浮动）。
+
+    分配规则（与 :func:`event_parser.redistribute_duration` 一致）：
+
+    * 动作时长不动，剩余时间按「平均步间间隔」铺开；
+    * 平均间隔填 0 表示自动：``(目标时长 - 动作总时长) / (步数 - 1)``；
+    * 随机浮动 N 秒表示每个间隔在 ``平均间隔 ± N`` 之间随机；
+    * 最后一步之后不再计算间隔。
+    """
 
     def __init__(self, current_ms: int, step_count: int,
                  parent: QWidget | None = None) -> None:
         hint = (f"当前总时长 {ep.format_duration(current_ms)}（{current_ms} 毫秒），"
                 f"共 {step_count} 个步骤。\n"
-                f"确认后会把这 {step_count} 个步骤在目标时长内均匀铺开，"
-                f"步骤内部的间隔保持不变。")
+                f"步骤动作本身的时长保持不变，其余时间按「平均步间间隔」铺开；"
+                f"间隔填 0 表示自动均分。随机浮动会让每个间隔在这个范围内上下抖动。")
         super().__init__("重设总时长", hint, "目标时长",
                          (("10 秒", 10_000), ("30 秒", 30_000),
                           ("1 分钟", 60_000), ("2 分钟", 120_000),
                           ("5 分钟", 300_000)),
                          parent)
+
+        # ---------- 平均步间间隔（秒）----------
+        self.spin_avg_gap = NumberField(0, 99999.999, 0.0, decimals=3, step=0.1)
+        self.spin_avg_gap.setFixedWidth(90)
+        self.spin_avg_gap.setToolTip(
+            "两步之间留多少空白时间；填 0 表示按目标时长自动均分"
+        )
+        self.form.addRow("平均步间间隔", self._unit_row(self.spin_avg_gap, "秒"))
+
+        # ---------- 间隔随机浮动（秒）----------
+        self.spin_jitter = NumberField(0, 99999.999, 0.0, decimals=3, step=0.1)
+        self.spin_jitter.setFixedWidth(90)
+        self.spin_jitter.setToolTip(
+            "每个间隔在「平均间隔 ± 该值」之间随机，0 表示不浮动"
+        )
+        self.form.addRow("间隔随机浮动", self._unit_row(self.spin_jitter, "秒"))
+
+        self.spin_avg_gap.valueChanged.connect(self._refresh_preview)
+        self.spin_jitter.valueChanged.connect(self._refresh_preview)
+
         self.set_value_ms(current_ms)
         if current_ms <= 0:
             self.set_value_ms(10_000)
+
+    def _unit_row(self, spin: NumberField, unit: str) -> QWidget:
+        """输入框 + 单位标签的一行（与主表单风格一致）。"""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(spin)
+        label = QLabel(unit)
+        label.setObjectName("Muted")
+        layout.addWidget(label)
+        layout.addStretch(1)
+        return row
+
+    def avg_gap_ms(self) -> int:
+        """平均步间间隔（毫秒）；0 表示按目标时长自动均分。"""
+        return int(round(self.spin_avg_gap.value() * 1000))
+
+    def jitter_ms(self) -> int:
+        """间隔随机浮动幅度（毫秒）。"""
+        return int(round(self.spin_jitter.value() * 1000))
+
+    def _refresh_preview(self) -> None:
+        """预览：目标时长 + 自动均分时的实际平均间隔。"""
+        self._value_ms = self.value_ms()
+        text = f"= {self._value_ms} 毫秒（{ep.format_duration(self._value_ms)}）"
+        avg_gap = self.avg_gap_ms()
+        if avg_gap > 0:
+            text += f"　·　固定间隔 {avg_gap / 1000:.3f} 秒"
+        self.preview.setText(text)
 
 
 def ask_step_time(step_description: str, step_index: int, total: int,
@@ -366,9 +425,14 @@ def ask_step_time(step_description: str, step_index: int, total: int,
 
 
 def ask_total_duration(current_ms: int, step_count: int,
-                       parent: QWidget | None = None) -> Optional[int]:
-    """弹出「重设总时长」对话框，返回毫秒；取消返回 None。"""
+                       parent: QWidget | None = None
+                       ) -> Optional[tuple[int, int, int]]:
+    """弹出「重设总时长」对话框。
+
+    返回 ``(目标总时长 ms, 平均步间间隔 ms, 间隔随机浮动 ms)``；
+    平均间隔为 0 表示按目标时长自动均分。取消返回 ``None``。
+    """
     dialog = DurationDialog(current_ms, step_count, parent)
     if dialog.exec() == QDialog.Accepted:
-        return dialog.value_ms()
+        return dialog.value_ms(), dialog.avg_gap_ms(), dialog.jitter_ms()
     return None

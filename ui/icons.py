@@ -5,7 +5,6 @@
 等编辑与脚本库图标。
 """
 
-from __future__ import annotations
 
 import math
 
