@@ -1434,6 +1434,81 @@ class TestRecorderInternals:
         assert len(recorded) == 1
 
 
+class TestRecorderPause:
+    """录制暂停/继续：丢弃暂停期间的输入，并从后续时间戳扣除暂停时长。"""
+
+    def _rec(self):
+        rec = Recorder(is_executing=lambda: False)
+        rec._recording = True
+        rec._t0 = time.monotonic()
+        return rec
+
+    def test_pause_drops_events(self):
+        from pynput import mouse as ms
+
+        rec = self._rec()
+        rec._handle_move(10, 10)
+        assert rec.pause() is True
+        rec._handle_move(500, 500)                      # 暂停期间 -> 丢弃
+        rec._handle_click(500, 500, ms.Button.left, True)
+        from pynput import keyboard as kb
+        rec._handle_press(kb.KeyCode.from_vk(65))
+        events = rec.get_events()
+        assert len(events) == 1
+        assert (events[0]["x"], events[0]["y"]) == (10, 10)
+
+    def test_pause_idempotent(self):
+        rec = self._rec()
+        assert rec.pause() is True
+        assert rec.pause() is False          # 重复暂停无副作用
+
+    def test_resume_without_pause_is_noop(self):
+        rec = self._rec()
+        assert rec.resume() is False
+
+    def test_resume_keeps_recording_and_appends(self):
+        rec = self._rec()
+        rec._handle_move(10, 10)
+        rec.pause()
+        rec.resume()
+        assert rec.is_paused is False
+        assert rec._recording is True
+        rec._handle_move(20, 20)
+        assert len(rec.get_events()) == 2
+
+    def test_pause_time_excluded_from_timestamps(self):
+        """恢复后的事件时间戳必须无缝衔接，暂停时长像凭空消失一样。"""
+        rec = self._rec()
+        rec._handle_move(10, 10)
+        # 模拟 2 秒暂停
+        rec.pause()
+        fake_now = rec.pause_start_time + 2.0
+        rec.resume()
+        rec.total_paused_time = 2.0  # 手动固定暂停时长，避免依赖真实计时
+        rec._handle_move(20, 20)
+        events = rec.get_events()
+        # 恢复后的时间戳应只比第一条略大，而不含那 2 秒暂停
+        assert events[1]["t"] - events[0]["t"] < 1000
+        assert rec.elapsed_ms() < 1000
+
+    def test_stop_while_paused_clears_pause_state(self):
+        rec = self._rec()
+        rec._handle_move(10, 10)
+        rec.pause()
+        rec.stop()
+        assert rec.is_paused is False
+        assert rec.is_recording is False
+
+    def test_f11_is_ignored_by_default(self):
+        from pynput import keyboard as kb
+
+        rec = self._rec()
+        rec._handle_press(kb.Key.f11)
+        rec._handle_release(kb.Key.f11)
+        assert rec.get_events() == []
+
+
+
 # ---------------------------------------------------------------------------
 # 热键管理
 # ---------------------------------------------------------------------------
@@ -1511,6 +1586,7 @@ class TestKeyToVk:
         assert key_to_vk("f6") == 0x75      # VK_F6
         assert key_to_vk("f8") == 0x77      # VK_F8
         assert key_to_vk("f9") == 0x78      # VK_F9
+        assert key_to_vk("f11") == 0x7A     # VK_F11
 
     def test_navigation_keys(self):
         from core.hotkey_manager import key_to_vk
@@ -2726,3 +2802,22 @@ class TestPollRecorderLifecycle:
 
     def test_recorder_t0_property_before_start(self):
         assert Recorder().t0 == 0.0
+
+    def test_pause_resume_lifecycle(self):
+        rec = PollRecorder()
+        rec.start(t0=time.monotonic())
+        try:
+            assert rec.is_paused is False
+            assert rec.pause() is True
+            assert rec.is_paused is True
+            assert rec.pause() is False           # 重复暂停无副作用
+            assert rec.resume() is True
+            assert rec.is_paused is False
+            assert rec.resume() is False          # 未暂停时恢复无副作用
+        finally:
+            rec.stop()
+        assert rec.is_paused is False
+
+    def test_pause_vk_defaults_to_f11(self):
+        assert PollRecorder().pause_vk == 0x7A
+

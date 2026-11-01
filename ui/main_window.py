@@ -14,6 +14,7 @@
 
 import logging
 import os
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -25,9 +26,9 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout,
 
 from core import event_parser as ep
 from core.config import Config, HOTKEY_LABELS
-from core.hotkey_manager import HotkeyManager, display_name, parse_key
+from core.hotkey_manager import HotkeyManager, display_name, key_to_vk, parse_key
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
-from core.recorder import Recorder
+from core.recorder import DEFAULT_IGNORED_KEYS, Recorder
 from core.poll_recorder import PollRecorder
 from ui import icons, styles
 from ui.event_list import EventListWidget, _make_icon
@@ -43,7 +44,7 @@ from utils.win_utils import WINDOW_TITLE, ensure_dir, is_admin
 
 log = logging.getLogger(__name__)
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 #: 内容区页面下标
 #: 页面下标。第六阶段把「脚本库」上移为第一页并改名为「回放与脚本」：
@@ -64,8 +65,41 @@ class State(Enum):
 
     IDLE = "idle"
     RECORDING = "recording"
+    RECORD_PAUSED = "record_paused"   # 录制暂停（暂停/继续录制热键）
     REPLAYING = "replaying"
     PAUSED = "paused"
+
+
+#: 标准按钮 -> 中文文案（消除原生英文 Yes/No/Save/Discard/Cancel）
+_STANDARD_BUTTON_TEXT: dict[QMessageBox.StandardButton, str] = {
+    QMessageBox.Yes: "确定",
+    QMessageBox.No: "取消",
+    QMessageBox.Save: "保存",
+    QMessageBox.Discard: "不保存",
+    QMessageBox.Cancel: "取消",
+}
+
+
+def ask_question(parent, title: str, text: str,
+                 buttons: QMessageBox.StandardButtons,
+                 default_button: QMessageBox.StandardButton,
+                 icon=QMessageBox.Question) -> QMessageBox.StandardButton:
+    """带中文按钮的确认框，返回值仍为 ``QMessageBox.StandardButton``。
+
+    与 ``QMessageBox.question`` 语义一致，但把标准按钮的英文文案替换为中文，
+    消除界面里出现的 ``Yes / No``。测试可直接 monkeypatch 本函数。
+    """
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setIcon(icon)
+    box.setText(text)
+    box.setStandardButtons(buttons)
+    for std_btn, label in _STANDARD_BUTTON_TEXT.items():
+        if buttons & std_btn:
+            box.setButtonText(std_btn, label)
+    box.setDefaultButton(default_button)
+    box.exec()
+    return box.standardButton(box.clickedButton())
 
 
 class MainWindow(WindowShell):
@@ -79,6 +113,7 @@ class MainWindow(WindowShell):
     sig_player_finished = Signal(str)    # finished / stopped
     sig_player_error = Signal(str)
     sig_poll_stop = Signal()             # 兼容轮询通道检测到停止热键（轮询线程）
+    sig_poll_pause = Signal()            # 兼容轮询通道检测到暂停/继续热键（轮询线程）
 
     def __init__(self, config: Optional[Config] = None) -> None:
         super().__init__(WINDOW_TITLE)
@@ -118,9 +153,12 @@ class MainWindow(WindowShell):
             on_event=self._on_recorder_event,
             on_error=self.sig_recorder_error.emit,
             on_stop_hotkey=self.sig_poll_stop.emit,
+            on_pause_hotkey=self.sig_poll_pause.emit,
         )
         # 轮询线程检测到「停止录制热键」按下沿 -> 切回主线程停止录制
         self.sig_poll_stop.connect(self.stop_recording)
+        # 轮询线程检测到「暂停/继续录制热键」按下沿 -> 切回主线程切换暂停
+        self.sig_poll_pause.connect(self.toggle_recording_pause)
         self.player = MacroPlayer(
             on_event=lambda idx, evt: self.sig_player_event.emit(idx, evt),
             on_finished=self.sig_player_finished.emit,
@@ -261,6 +299,9 @@ class MainWindow(WindowShell):
         self.btn_start_record = QPushButton("开始录制", page)
         self.btn_start_record.setObjectName("PrimaryButton")
         self.btn_start_record.setIcon(_make_icon(icons.ICON_RECORD, styles.ICON_ON_PRIMARY))
+        self.btn_pause_record = QPushButton("暂停录制", page)
+        self.btn_pause_record.setObjectName("SecondaryButton")
+        self.btn_pause_record.setToolTip("暂停/继续录制（暂停期间的输入不会记入脚本）")
         self.btn_stop_record = QPushButton("停止录制", page)
         self.btn_stop_record.setObjectName("DangerButton")
         self.btn_start_play = QPushButton("开始回放", page)
@@ -273,8 +314,8 @@ class MainWindow(WindowShell):
         self.btn_reset_step.setIcon(_make_icon(icons.ICON_REFRESH, styles.ICON_ON_SECONDARY))
         self.btn_reset_step.setToolTip("模式二：把步骤指针复位到开头")
 
-        for btn in (self.btn_start_record, self.btn_stop_record, self.btn_start_play,
-                    self.btn_stop_play, self.btn_reset_step):
+        for btn in (self.btn_start_record, self.btn_pause_record, self.btn_stop_record,
+                    self.btn_start_play, self.btn_stop_play, self.btn_reset_step):
             btn.setIconSize(_TOOL_ICON_SIZE)
             btn.setCursor(Qt.PointingHandCursor)
             button_row.addWidget(btn)
@@ -453,6 +494,7 @@ class MainWindow(WindowShell):
 
         # 顶部按钮
         self.btn_start_record.clicked.connect(self.start_recording)
+        self.btn_pause_record.clicked.connect(self.toggle_recording_pause)
         self.btn_stop_record.clicked.connect(self.stop_recording)
         self.btn_start_play.clicked.connect(self.start_replay)
         self.btn_stop_play.clicked.connect(self.stop_replay)
@@ -500,6 +542,7 @@ class MainWindow(WindowShell):
         """按配置重新注册全部全局热键，失败时提示用户改键。"""
         callbacks = {
             "record_stop": lambda: self.sig_hotkey.emit("record_stop"),
+            "record_pause": lambda: self.sig_hotkey.emit("record_pause"),
             "play_toggle": lambda: self.sig_hotkey.emit("play_toggle"),
             "pause_toggle": lambda: self.sig_hotkey.emit("pause_toggle"),
             "play_stop": lambda: self.sig_hotkey.emit("play_stop"),
@@ -586,8 +629,12 @@ class MainWindow(WindowShell):
           当前回放再单步，两个执行通道互斥，见 _enter_step_mode）。
         """
         if action == "record_stop":
-            if self.state is State.RECORDING:
+            if self.state in (State.RECORDING, State.RECORD_PAUSED):
                 self.stop_recording()
+            return
+        if action == "record_pause":
+            if self.state in (State.RECORDING, State.RECORD_PAUSED):
+                self.toggle_recording_pause()
             return
         # 已释放脚本（或从未加载）时，回放与单步热键一律静默忽略
         if action in ("play_toggle", "pause_toggle", "play_stop",
@@ -595,7 +642,7 @@ class MainWindow(WindowShell):
             if not self._current_events():
                 return
         if action == "play_toggle":
-            if self.state is State.RECORDING:
+            if self.state in (State.RECORDING, State.RECORD_PAUSED):
                 return
             if self.state in (State.REPLAYING, State.PAUSED):
                 self._toggle_pause()
@@ -605,7 +652,7 @@ class MainWindow(WindowShell):
                 self.start_replay()
             return
         if action == "pause_toggle":
-            if self.state is State.RECORDING:
+            if self.state in (State.RECORDING, State.RECORD_PAUSED):
                 return
             if self.state in (State.REPLAYING, State.PAUSED):
                 self._toggle_pause()
@@ -630,7 +677,7 @@ class MainWindow(WindowShell):
             self.step_prev()
             return
         if action == "step_reset":
-            if self.state is State.RECORDING:
+            if self.state in (State.RECORDING, State.RECORD_PAUSED):
                 self._set_message("正在录制中，无法重置指针。")
                 return
             self._enter_step_mode()
@@ -644,8 +691,9 @@ class MainWindow(WindowShell):
         """开始录制。已有脚本内容时先确认覆盖，避免录到一半才发现丢数据。"""
         if not self._ensure_mode(MODE_TIMED, "开始录制"):
             return
-        # 提前拦截：已加载脚本 / 内存中已有步骤时，先问清楚再覆盖
-        if self._current_events() or self._current_script is not None:
+        # 只有当前确实有录制好的步骤时，才先问清楚再覆盖；空脚本（0 步）
+        # 直接清空开始，不弹窗，避免「新建空脚本后点录制」被无谓打扰。
+        if self._script_steps:
             if not self._confirm_replace_for_record():
                 return
         player = self.config.get("player", {}) or {}
@@ -658,18 +706,35 @@ class MainWindow(WindowShell):
             return
         # 兼容通道与钩子通道共用时间基与参数；它只在腾讯系前台产出事件，
         # 启动失败不影响普通录制，仅记录日志。
-        stop_vk = 0x78  # 默认 F9
+        stop_vk = 0x78   # 默认 F9
+        pause_vk = 0x7A  # 默认 F11
+        hotkeys = self.config.get("hotkeys", {}) or {}
         try:
-            token = (self.config.get("hotkeys", {}) or {}).get(
-                "record_stop", "f9")
-            vk = getattr(parse_key(token), "vk", None)
+            vk = key_to_vk(hotkeys.get("record_stop", "f9"))
             if isinstance(vk, int):
                 stop_vk = vk
         except Exception:
             log.debug("解析停止热键 VK 失败，兼容通道使用默认 F9", exc_info=True)
+        try:
+            vk = key_to_vk(hotkeys.get("record_pause", "f11"))
+            if isinstance(vk, int):
+                pause_vk = vk
+        except Exception:
+            log.debug("解析暂停热键 VK 失败，兼容通道使用默认 F11", exc_info=True)
+        # 录制期间，把停止/暂停控制键的 token 与 vk 两种写法都加入忽略名单，
+        # 保证用户改键后同样不会把控制键录进脚本。
+        self.recorder.ignored_keys = set(DEFAULT_IGNORED_KEYS)
+        for action in ("record_stop", "record_pause"):
+            token = str(hotkeys.get(action, "")).strip().lower()
+            if token:
+                self.recorder.ignored_keys.add(token)
+            vk = key_to_vk(token) if token else None
+            if isinstance(vk, int):
+                self.recorder.ignored_keys.add(f"vk:{vk}")
         if not self.poll_recorder.start(
                 t0=self.recorder.t0,
                 stop_vk=stop_vk,
+                pause_vk=pause_vk,
                 min_interval_ms=int(player.get("move_min_interval_ms", 50)),
                 min_distance_px=int(player.get("move_min_distance_px", 2)),
         ):
@@ -685,12 +750,13 @@ class MainWindow(WindowShell):
         self._record_timer.start()
         self._set_message(
             f"正在录制… 按 "
+            f"{self.hotkeys.binding_display('record_pause') or 'F11'} 暂停/继续，"
             f"{self.hotkeys.binding_display('record_stop') or 'F9'} 停止录制。"
         )
 
     def stop_recording(self) -> None:
         """停止录制，保存到内存并刷新界面。"""
-        if self.state is not State.RECORDING:
+        if self.state not in (State.RECORDING, State.RECORD_PAUSED):
             return
         self._record_timer.stop()
         self.recorder.stop()
@@ -710,6 +776,23 @@ class MainWindow(WindowShell):
             f"{len(self._script_steps)} 个步骤，时长 {duration / 1000:.2f} 秒。"
             "可在下方勾选编辑，或直接回放。"
         )
+
+    def toggle_recording_pause(self) -> None:
+        """暂停/继续录制（对应 F11 或界面「暂停录制」按钮）。
+
+        暂停时两个录制通道都停止采集、丢弃输入；继续时扣除累计暂停时长，
+        保证恢复后的事件时间戳与暂停前无缝衔接。暂停期间仍可停止录制。
+        """
+        if self.state is State.RECORDING:
+            self.recorder.pause()
+            self.poll_recorder.pause()
+            self._set_state(State.RECORD_PAUSED)
+            pause_key = self.hotkeys.binding_display('record_pause') or 'F11'
+            self._set_message(f"录制已暂停，按下 {pause_key} 或点击按钮继续。")
+        elif self.state is State.RECORD_PAUSED:
+            self.recorder.resume()
+            self.poll_recorder.resume()
+            self._set_state(State.RECORDING)
 
     def _sync_after_recording(self, events: Optional[list[dict[str, Any]]] = None) -> None:
         """把录制结果同步到界面与回放器（停止录制、或外部直接喂数据时使用）。
@@ -760,7 +843,7 @@ class MainWindow(WindowShell):
     # ==================================================================
     def start_replay(self) -> None:
         """开始回放：模式一走时间轴，模式二提示使用热键单步。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法回放。请先按停止录制。")
             return
         events = self._current_events()
@@ -864,7 +947,7 @@ class MainWindow(WindowShell):
     # ==================================================================
     def step_next(self) -> None:
         """执行下一步操作单元。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法单步执行。")
             return
         if not self._current_events():
@@ -887,7 +970,7 @@ class MainWindow(WindowShell):
 
     def step_prev(self) -> None:
         """回退并重新执行上一步操作单元。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法单步执行。")
             return
         if not self._current_events():
@@ -988,7 +1071,7 @@ class MainWindow(WindowShell):
 
     def _on_edit_action(self, action: str) -> None:
         """步骤编辑器工具栏动作统一入口。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法编辑步骤。")
             return
 
@@ -1035,7 +1118,7 @@ class MainWindow(WindowShell):
         编辑顺序：先重建事件内容（动作/坐标/键/高级选项）→ 再调持续时长
         → 最后调起始时间（后续步骤平移）。
         """
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法编辑步骤。")
             return
         if self.state in (State.REPLAYING, State.PAUSED):
@@ -1309,7 +1392,7 @@ class MainWindow(WindowShell):
 
     def reset_total_duration(self) -> None:
         """弹窗输入目标总时长 / 平均间隔 / 随机浮动，重新分配整段脚本的时间轴。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法重设总时长。")
             return
         if not self._script_steps:
@@ -1374,7 +1457,7 @@ class MainWindow(WindowShell):
             return True
         if self._current_script is not None and Path(self._current_script) == target:
             return True
-        answer = QMessageBox.question(
+        answer = ask_question(
             self, "覆盖确认",
             f"脚本目录里已经存在「{target.name}」。\n确定要覆盖它吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -1423,7 +1506,11 @@ class MainWindow(WindowShell):
         # 这里只是把补全后的名字回填到下拉框，不能因此把脚本标记成「已修改」
         self.set_script_name(name, mark_dirty=False)
         target = ensure_dir(self.config.scripts_path()) / (_safe_filename(name) + ".json")
-        return self._save_to_path(target, silent=silent, ask_overwrite=True)
+        # 自动生成的默认名（如「录制-20261101-114254」）或刚录制未命名时，
+        # 直接静默覆盖保存，不弹覆盖确认；只有用户改了名字、目标与当前文件
+        # 不同才需要确认（避免误覆盖别人的脚本）。
+        ask = not self._is_default_script_name(name)
+        return self._save_to_path(target, silent=silent, ask_overwrite=ask)
 
     def save_script_as(self) -> None:
         """另存为指定路径。"""
@@ -1491,11 +1578,11 @@ class MainWindow(WindowShell):
 
     def clear_events(self) -> None:
         """清空当前事件与步骤指针。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法清空。")
             return
         if self._current_events() and self.is_dirty:
-            answer = QMessageBox.question(
+            answer = ask_question(
                 self, "清空步骤",
                 "当前内容尚未保存，确定要清空吗？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
@@ -1518,7 +1605,7 @@ class MainWindow(WindowShell):
         与「清空步骤」的区别：释放不涉及未保存提示，且会把脚本名一起清掉，
         回放/单步热键在释放后不再响应（见 :meth:`_on_hotkey_action`）。
         """
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法释放脚本。")
             return
         if self.state in (State.REPLAYING, State.PAUSED):
@@ -1574,7 +1661,7 @@ class MainWindow(WindowShell):
         path_str = combo.itemData(index)
         if not path_str:
             return
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法加载脚本。")
             self._sync_script_combo_text()
             return
@@ -1625,7 +1712,7 @@ class MainWindow(WindowShell):
         if path is None:
             self._set_message("请先在列表里选择一个脚本。")
             return
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法加载脚本。")
             return
         if self._current_script == path:
@@ -1646,7 +1733,7 @@ class MainWindow(WindowShell):
 
         如果当前有未保存修改，先确认，避免误丢。
         """
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法新建脚本。")
             return
         if not self._confirm_discard_unsaved("新建脚本"):
@@ -1723,10 +1810,11 @@ class MainWindow(WindowShell):
         if path is None:
             self._set_message("请先在脚本库中选择一个脚本。")
             return
-        answer = QMessageBox.question(
+        answer = ask_question(
             self, "删除脚本",
             f"确定要删除脚本「{path.stem}」吗？\n\n此操作不可撤销。",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            icon=QMessageBox.Warning,
         )
         if answer != QMessageBox.Yes:
             return
@@ -1912,12 +2000,15 @@ class MainWindow(WindowShell):
         """状态机切换：统一刷新按钮可用性与侧边栏动画。"""
         self.state = state
         recording = state is State.RECORDING
+        record_session = state in (State.RECORDING, State.RECORD_PAUSED)
         replaying = state in (State.REPLAYING, State.PAUSED)
         has_content = bool(self._current_events())
-        editing = not recording and not replaying
+        editing = not record_session and not replaying
 
         self.btn_start_record.setEnabled(editing)
-        self.btn_stop_record.setEnabled(recording)
+        self.btn_stop_record.setEnabled(record_session)
+        self.btn_pause_record.setEnabled(record_session)
+        self.btn_pause_record.setText("继续录制" if state is State.RECORD_PAUSED else "暂停录制")
         self.btn_start_play.setEnabled(editing and has_content)
         self.btn_stop_play.setEnabled(replaying)
         self.mode_combo.setEnabled(editing)
@@ -1936,8 +2027,9 @@ class MainWindow(WindowShell):
         # 「释放脚本」只在确实有已加载内容时可用
         self.page_library.btn_release.setEnabled(editing and has_content)
 
+        # 录制中红色脉冲动画；暂停时停止脉冲但仍保持「录制」高亮
         self.sidebar.set_recording(recording)
-        if recording:
+        if record_session:
             self.sidebar.set_active("record")
 
         if state is State.PAUSED:
@@ -1951,6 +2043,7 @@ class MainWindow(WindowShell):
         mode = self.mode_combo.currentData()
         mode_text = {
             State.RECORDING: "录制中",
+            State.RECORD_PAUSED: "录制已暂停",
             State.REPLAYING: "回放中",
             State.PAUSED: "已暂停",
         }.get(self.state, "就绪")
@@ -2001,6 +2094,10 @@ class MainWindow(WindowShell):
 
         parts: list[str] = []
         if self.state is State.RECORDING:
+            parts.append(f"{key('record_pause')} 暂停录制")
+            parts.append(f"{key('record_stop')} 停止录制")
+        elif self.state is State.RECORD_PAUSED:
+            parts.append(f"{key('record_pause')} 继续录制")
             parts.append(f"{key('record_stop')} 停止录制")
         elif self.state in (State.REPLAYING, State.PAUSED):
             parts.append(f"{key('play_toggle')} 暂停/继续")
@@ -2081,7 +2178,7 @@ class MainWindow(WindowShell):
         """
         if not self._unsaved or not self._current_events():
             return True
-        answer = QMessageBox.question(
+        answer = ask_question(
             self, action,
             f"当前脚本「{self.script_name() or '未命名'}」有未保存的修改。\n"
             f"要先保存再{action}吗？",
@@ -2103,6 +2200,15 @@ class MainWindow(WindowShell):
     def _default_script_name(self) -> str:
         import time
         return time.strftime("录制-%Y%m%d-%H%M%S")
+
+    def _is_default_script_name(self, name: str) -> bool:
+        """判断脚本名是否为软件自动生成的默认名（``录制-YYYYMMDD-HHMMSS``）。
+
+        这类名字说明用户还没主动起名，保存时静默覆盖即可，不必弹确认框。
+        """
+        if not name:
+            return True
+        return bool(re.match(r"^录制-\d{8}-\d{6}$", name))
 
     def _show_page(self, index: int) -> None:
         """切换主内容区页面并同步侧边栏高亮。"""
@@ -2256,7 +2362,7 @@ class MainWindow(WindowShell):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """关闭前：停止录制/回放、保存窗口位置、提示未落盘的修改。"""
-        if self.state is State.RECORDING:
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self.stop_recording()
         if self.state in (State.REPLAYING, State.PAUSED):
             self.stop_replay()

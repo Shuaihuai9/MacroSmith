@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 #: 所有可配置热键的默认值（键名 -> 默认按键）
 DEFAULT_HOTKEYS: dict[str, str] = {
     "record_stop": "f9",     # 停止录制
+    "record_pause": "f11",   # 暂停/继续录制
     "play_toggle": "f6",     # 模式一：开始回放
     "pause_toggle": "f7",    # 模式一：暂停/继续
     "play_stop": "f8",       # 模式一：停止回放
@@ -51,6 +52,7 @@ DEFAULT_HOTKEYS: dict[str, str] = {
 #: 热键的界面显示名与说明
 HOTKEY_LABELS: dict[str, tuple[str, str]] = {
     "record_stop": ("停止录制", "录制过程中结束录制并保存事件序列"),
+    "record_pause": ("暂停 / 继续录制", "录制过程中暂停采集，再次按下继续（暂停时长不计入脚本）"),
     "play_toggle": ("开始回放", "模式一：按录制时的时间间隔原速回放"),
     "pause_toggle": ("暂停 / 继续", "模式一：暂停后保持执行位置，再次按下继续"),
     "play_stop": ("停止回放", "模式一：终止回放并把执行指针归零"),

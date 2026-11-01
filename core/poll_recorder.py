@@ -129,6 +129,8 @@ class PollRecorder:
     on_stop_hotkey:
         ``fn()``，兼容模式下检测到「停止录制热键」按下沿时回调
         （低层钩子热键在腾讯系前台同样会失效，因此这里兜底）。
+    on_pause_hotkey:
+        ``fn()``，检测到「暂停/继续录制热键」按下沿时回调。
     """
 
     def __init__(
@@ -137,16 +139,21 @@ class PollRecorder:
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
         on_stop_hotkey: Optional[Callable[[], None]] = None,
+        on_pause_hotkey: Optional[Callable[[], None]] = None,
     ) -> None:
         self._is_executing = is_executing or (lambda: False)
         self._on_event = on_event
         self._on_error = on_error
         self._on_stop_hotkey = on_stop_hotkey
+        self._on_pause_hotkey = on_pause_hotkey
 
         self._lock = threading.RLock()
         self._events: list[dict[str, Any]] = []
         self._recording = False
         self._t0 = 0.0
+        self.is_paused = False
+        self.pause_start_time: Optional[float] = None
+        self.total_paused_time = 0.0
 
         self.move_min_interval_ms = 50
         self.move_min_distance_px = 2
@@ -155,6 +162,8 @@ class PollRecorder:
         #: 停止录制热键的 VK（默认 F9 = 0x78），可通过 start() 的参数覆盖。
         #: 该键按下沿触发 on_stop_hotkey，且本身不会被录进事件。
         self.stop_vk: int = 0x78
+        #: 暂停/继续录制热键的 VK（默认 F11 = 0x7A）。
+        self.pause_vk: int = 0x7A
 
         # 上一轮输入状态快照（vk -> 是否按下），沿检测的基准
         self._prev_mouse: dict[int, bool] = {}
@@ -185,7 +194,10 @@ class PollRecorder:
         with self._lock:
             if not self._recording:
                 return int(self._events[-1]["t"]) if self._events else 0
-            return int((time.monotonic() - self._t0) * 1000)
+            now = self.pause_start_time if self.is_paused else time.monotonic()
+            if now is None:
+                now = time.monotonic()
+            return max(0, int((now - self._t0 - self.total_paused_time) * 1000))
 
     def get_events(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -195,7 +207,7 @@ class PollRecorder:
     # 开始 / 停止
     # ------------------------------------------------------------------
     def start(self, t0: float, stop_vk: int = 0x78,
-              min_interval_ms: int = 50,
+              pause_vk: int = 0x7A, min_interval_ms: int = 50,
               min_distance_px: int = 2) -> bool:
         """开始轮询录制。
 
@@ -206,6 +218,8 @@ class PollRecorder:
             保证两通道事件时间戳可直接合并排序。
         stop_vk:
             停止录制热键的 VK 码，按下沿触发 ``on_stop_hotkey``。
+        pause_vk:
+            暂停/继续录制热键的 VK 码，按下沿触发 ``on_pause_hotkey``。
         """
         if self._user32 is None:  # pragma: no cover
             self._notify_error("轮询录制器不可用：WinAPI 加载失败。")
@@ -217,8 +231,12 @@ class PollRecorder:
             self._last_move = None
             self._prev_mouse = {}
             self._prev_keys = {}
+            self.is_paused = False
+            self.pause_start_time = None
+            self.total_paused_time = 0.0
             self._t0 = float(t0)
             self.stop_vk = int(stop_vk) & 0xFF
+            self.pause_vk = int(pause_vk) & 0xFF
             self.move_min_interval_ms = int(min_interval_ms)
             self.move_min_distance_px = int(min_distance_px)
             self._recording = True
@@ -228,12 +246,36 @@ class PollRecorder:
         self._thread.start()
         return True
 
+    def pause(self) -> bool:
+        """暂停产出事件，但继续扫描停止与暂停热键。"""
+        with self._lock:
+            if not self._recording or self.is_paused:
+                return False
+            self.pause_start_time = time.monotonic()
+            self.is_paused = True
+            return True
+
+    def resume(self) -> bool:
+        """恢复产出事件，并扣除本次暂停时长。"""
+        with self._lock:
+            if not self._recording or not self.is_paused:
+                return False
+            now = time.monotonic()
+            if self.pause_start_time is not None:
+                self.total_paused_time += max(0.0, now - self.pause_start_time)
+            self.pause_start_time = None
+            self.is_paused = False
+            self._last_move = None
+            return True
+
     def stop(self) -> list[dict[str, Any]]:
         """停止轮询，返回清洗后的事件列表（与 Recorder.stop 语义一致）。"""
         with self._lock:
             if not self._recording:
                 return self.get_events()
             self._recording = False
+            self.is_paused = False
+            self.pause_start_time = None
 
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -277,8 +319,8 @@ class PollRecorder:
         pressed: list[dict[str, Any]] = []
         released: list[dict[str, Any]] = []
 
-        # 鼠标按键沿（只在黑名单前台时产出）
-        if active and not skip:
+        # 鼠标按键沿（只在黑名单前台且未暂停时产出）
+        if active and not skip and not self.is_paused:
             for vk, button in _MOUSE_BUTTON_VKS:
                 was = self._prev_mouse.get(vk, False)
                 now = mouse_now[vk]
@@ -289,13 +331,20 @@ class PollRecorder:
                     released.append(ep.make_click_event(
                         self._stamp(), "release", button, x, y))
 
-        # 键盘沿（只在黑名单前台时产出；stop_vk 触发兜底热键）
+        # 键盘沿：暂停时仍扫描控制热键，其余输入只刷新快照、不产出。
         if active and not skip:
             for vk, now in keys_now.items():
                 if vk == self.stop_vk:
                     was = self._prev_keys.get(vk, False)
                     if now and not was:
                         self._fire_stop_hotkey()
+                    continue
+                if vk == self.pause_vk:
+                    was = self._prev_keys.get(vk, False)
+                    if now and not was:
+                        self._fire_pause_hotkey()
+                    continue
+                if self.is_paused:
                     continue
                 was = self._prev_keys.get(vk, False)
                 if now and not was:
@@ -312,7 +361,7 @@ class PollRecorder:
             return
 
         # 鼠标移动（带抖动过滤，规则与 Recorder._handle_move 一致）
-        if has_cursor and not skip:
+        if has_cursor and not skip and not self.is_paused:
             self._maybe_record_move(x, y)
 
         for event in pressed:
@@ -337,7 +386,9 @@ class PollRecorder:
     # 内部工具
     # ------------------------------------------------------------------
     def _stamp(self) -> int:
-        return int((time.monotonic() - self._t0) * 1000)
+        with self._lock:
+            return max(0, int(
+                (time.monotonic() - self._t0 - self.total_paused_time) * 1000))
 
     def _skip(self) -> bool:
         """回放期间为 True：只刷新快照，不产出事件。"""
@@ -355,9 +406,17 @@ class PollRecorder:
         except Exception:  # pragma: no cover
             log.debug("on_stop_hotkey 回调异常", exc_info=True)
 
+    def _fire_pause_hotkey(self) -> None:
+        if self._on_pause_hotkey is None:
+            return
+        try:
+            self._on_pause_hotkey()
+        except Exception:  # pragma: no cover
+            log.debug("on_pause_hotkey 回调异常", exc_info=True)
+
     def _append(self, event: dict[str, Any]) -> None:
         with self._lock:
-            if not self._recording:
+            if not self._recording or self.is_paused:
                 return
             self._events.append(event)
         if self._on_event is not None:

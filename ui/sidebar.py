@@ -161,7 +161,7 @@ class Sidebar(QWidget):
             icons.ICON_LIBRARY,
             "回放与脚本（选择脚本 · 循环设置 · 开始/停止回放）", self)
         self.btn_record = IconButton(
-            icons.ICON_RECORD, "录制与步骤编辑（F9 停止录制）", self)
+            icons.ICON_RECORD, "录制与步骤编辑（F11 暂停/继续 · F9 停止录制）", self)
         self.btn_settings = IconButton(icons.ICON_SETTINGS, "设置（热键与录制选项）", self)
         self.btn_about = IconButton(icons.ICON_ABOUT, "关于 宏匠", self)
 

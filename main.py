@@ -264,8 +264,9 @@ def run_startup_check(app, window, log) -> int:
         ("热键独占模式", window.hotkeys.exclusive,
          "已开启（命中热键不再传给前台程序）" if window.hotkeys.exclusive
          else "已关闭（按键会同时触发前台程序）"),
-        ("热键绑定完整", len(hotkeys) == 7, "、".join(f"{k}={v}" for k, v in hotkeys.items())),
-        ("停止录制键不入脚本", "f9" in window.recorder.ignored_keys,
+        ("热键绑定完整", len(hotkeys) == 8, "、".join(f"{k}={v}" for k, v in hotkeys.items())),
+        ("停止录制键不入脚本", "f9" in window.recorder.ignored_keys
+         and "f11" in window.recorder.ignored_keys,
          "、" .join(sorted(window.recorder.ignored_keys))),
         ("始终记录移动与点击", not hasattr(window, "chk_clicks_only"),
          "「仅录制点击坐标」「记录鼠标移动」开关已删除（第九阶段）"),

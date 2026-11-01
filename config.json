@@ -1,6 +1,7 @@
 {
   "hotkeys": {
     "record_stop": "f9",
+    "record_pause": "f11",
     "play_toggle": "f6",
     "pause_toggle": "f7",
     "play_stop": "f8",
@@ -12,7 +13,7 @@
     "x": 1876,
     "y": 553,
     "width": 1000,
-    "height": 700
+    "height": 874
   },
   "hotkey_exclusive": true,
   "merge": {
@@ -32,5 +33,5 @@
     "record_clicks_only": false
   },
   "scripts_dir": "data/scripts",
-  "last_script": ""
+  "last_script": "D:\\WorkBuddy\\MacroSmith\\data\\scripts\\录制-20261101-122216.json"
 }

@@ -29,15 +29,17 @@ log = logging.getLogger(__name__)
 #: 单个监听器停止时的等待上限（秒），避免界面卡死
 _JOIN_TIMEOUT = 1.0
 
-#: 默认永不录制的按键：停止录制热键 F9。
+#: 默认永不录制的按键：停止录制 F9、暂停/继续录制 F11。
 #:
 #: 同一物理键在不同来源下标识不同，两种写法都要列上：
 #: * pynput 回调看到 ``Key.f9`` -> 序列化成 token ``"f9"``；
 #: * 从 vk 还原（或旧脚本）时是 ``"vk:120"``（VK_F9 = 0x78 = 120）。
-DEFAULT_IGNORED_KEYS: frozenset[str] = frozenset({"f9", "vk:120"})
+DEFAULT_IGNORED_KEYS: frozenset[str] = frozenset({
+    "f9", "vk:120", "f11", "vk:122",
+})
 
-#: 默认忽略的按键对应的虚拟键码（用于扫描旧脚本里以 vk 形式存在的 F9）
-DEFAULT_IGNORED_VKS: frozenset[int] = frozenset({0x78})
+#: 默认忽略的按键对应的虚拟键码（用于扫描旧脚本里以 vk 形式存在的控制键）
+DEFAULT_IGNORED_VKS: frozenset[int] = frozenset({0x78, 0x7A})
 
 
 class Recorder:
@@ -67,6 +69,10 @@ class Recorder:
         self._events: list[dict[str, Any]] = []
         self._recording = False
         self._t0 = 0.0                      # 录制起点（monotonic 秒）
+        # 暂停仍会保持录制会话，但丢弃输入，并从后续时间戳扣除暂停时长。
+        self.is_paused = False
+        self.pause_start_time: Optional[float] = None
+        self.total_paused_time = 0.0         # 累计暂停时长（monotonic 秒）
         self._mouse_listener: Optional[mouse.Listener] = None
         self._key_listener: Optional[keyboard.Listener] = None
 
@@ -104,11 +110,14 @@ class Recorder:
         return self._t0
 
     def elapsed_ms(self) -> int:
-        """当前已录制时长（毫秒）。"""
+        """当前有效录制时长（毫秒），不含暂停时间。"""
         with self._lock:
             if not self._recording:
                 return int(self._events[-1]["t"]) if self._events else 0
-            return int((time.monotonic() - self._t0) * 1000)
+            now = self.pause_start_time if self.is_paused else time.monotonic()
+            if now is None:  # 防御性：状态异常时也不让时长倒流
+                now = time.monotonic()
+            return max(0, int((now - self._t0 - self.total_paused_time) * 1000))
 
     def get_events(self) -> list[dict[str, Any]]:
         """返回事件列表的副本（线程安全）。"""
@@ -129,6 +138,9 @@ class Recorder:
                 return False
             self._events = []
             self._last_move = None
+            self.is_paused = False
+            self.pause_start_time = None
+            self.total_paused_time = 0.0
             self.move_min_interval_ms = int(min_interval_ms)
             self.move_min_distance_px = int(min_distance_px)
             # 时间基准：录制开始时取一次 monotonic，之后所有事件都用它做差
@@ -158,12 +170,37 @@ class Recorder:
             return False
         return True
 
+    def pause(self) -> bool:
+        """暂停采集；录制会话保持活动，返回状态是否发生变化。"""
+        with self._lock:
+            if not self._recording or self.is_paused:
+                return False
+            self.pause_start_time = time.monotonic()
+            self.is_paused = True
+            return True
+
+    def resume(self) -> bool:
+        """继续采集，并把本次暂停时长从后续事件时间戳中扣除。"""
+        with self._lock:
+            if not self._recording or not self.is_paused:
+                return False
+            now = time.monotonic()
+            if self.pause_start_time is not None:
+                self.total_paused_time += max(0.0, now - self.pause_start_time)
+            self.pause_start_time = None
+            self.is_paused = False
+            # 暂停前的鼠标状态不参与恢复后的抖动时间判断。
+            self._last_move = None
+            return True
+
     def stop(self) -> list[dict[str, Any]]:
         """停止录制，返回清洗后的事件列表（已补全未释放的按键/按钮）。"""
         with self._lock:
             if not self._recording:
                 return self.get_events()
             self._recording = False
+            self.is_paused = False
+            self.pause_start_time = None
             events = list(self._events)
 
         # 先停止监听线程，确保不会再有新事件写入
@@ -196,15 +233,19 @@ class Recorder:
     # 内部工具
     # ------------------------------------------------------------------
     def _stamp(self) -> int:
-        """生成事件时间戳：相对录制开始的毫秒数。"""
-        return int((time.monotonic() - self._t0) * 1000)
+        """生成事件时间戳：相对录制开始，且不含累计暂停时长。"""
+        with self._lock:
+            return max(0, int(
+                (time.monotonic() - self._t0 - self.total_paused_time) * 1000))
 
     def _skip(self) -> bool:
-        """是否需要忽略当前事件（正在回放自己发出的事件）。
+        """是否忽略当前事件：暂停期间，或程序正在回放自己发出的事件。
 
         标志位读取异常时保守地按“不忽略”处理：宁可多录一条，
         也不要因为一次异常把整段录制吞掉；同时写日志便于排查。
         """
+        if self.is_paused:
+            return True
         try:
             return bool(self._is_executing())
         except Exception:  # pragma: no cover - 防御性
@@ -213,7 +254,7 @@ class Recorder:
 
     def _append(self, event: dict[str, Any]) -> None:
         with self._lock:
-            if not self._recording:
+            if not self._recording or self.is_paused:
                 return
             self._events.append(event)
         if self._on_event is not None:

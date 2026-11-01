@@ -16,8 +16,8 @@ python -m nuitka --standalone --enable-plugin=pyside6 ^
   --include-package=pynput ^
   --company-name=Shuaihuai9 ^
   --product-name=MacroSmith ^
-  --file-version=1.1.0 ^
-  --product-version=1.1.0 ^
+  --file-version=1.2.0 ^
+  --product-version=1.2.0 ^
   --file-description="MacroSmith macro tool" ^
   --assume-yes-for-downloads ^
   --remove-output ^

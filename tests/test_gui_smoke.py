@@ -70,7 +70,8 @@ def window(qapp, config: Config, monkeypatch):
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
     monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
     monkeypatch.setattr(QMessageBox, "critical", staticmethod(lambda *a, **k: None))
-    monkeypatch.setattr(QMessageBox, "question",
+    # 中文确认框统一走 ask_question，这里打桩默认「确定」，避免离屏环境阻塞
+    monkeypatch.setattr("ui.main_window.ask_question",
                         staticmethod(lambda *a, **k: QMessageBox.Yes))
 
     win = MainWindow(config)
@@ -372,6 +373,83 @@ class TestRecordingFlow:
         assert window.event_list.table.rowCount() == 0
         assert window.player.step_total == 0
         assert window.btn_start_play.isEnabled() is False
+
+
+# ===========================================================================
+# 录制暂停 / 继续（v1.2.0）
+# ===========================================================================
+class TestRecordingPause:
+    def _start(self, window, monkeypatch):
+        monkeypatch.setattr(window.recorder, "start", lambda **kwargs: True)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        window.start_recording()
+        assert window.state is State.RECORDING
+
+    def test_pause_button_disabled_when_idle(self, window):
+        assert window.btn_pause_record.isEnabled() is False
+        assert window.btn_pause_record.text() == "暂停录制"
+
+    def test_pause_button_enabled_while_recording(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        assert window.btn_pause_record.isEnabled() is True
+        assert window.btn_stop_record.isEnabled() is True
+        window.stop_recording()
+        _pump(qapp, 80)
+
+    def test_pause_resume_toggles_state_and_text(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        window.toggle_recording_pause()
+        assert window.state is State.RECORD_PAUSED
+        assert window.btn_pause_record.text() == "继续录制"
+        assert window.btn_pause_record.isEnabled() is True
+        assert window.btn_stop_record.isEnabled() is True
+        assert "暂停" in window.message_label.text()
+        window.toggle_recording_pause()
+        assert window.state is State.RECORDING
+        assert window.btn_pause_record.text() == "暂停录制"
+        window.stop_recording()
+        _pump(qapp, 80)
+
+    def test_pause_hotkey_toggles(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        window._on_hotkey_action("record_pause")
+        assert window.state is State.RECORD_PAUSED
+        window._on_hotkey_action("record_pause")
+        assert window.state is State.RECORDING
+        window.stop_recording()
+        _pump(qapp, 80)
+
+    def test_pause_hotkey_ignored_when_idle(self, window, qapp):
+        window._on_hotkey_action("record_pause")
+        assert window.state is State.IDLE
+
+    def test_stop_while_paused(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        window.toggle_recording_pause()
+        assert window.state is State.RECORD_PAUSED
+        window.stop_recording()
+        _pump(qapp, 120)
+        assert window.state is State.IDLE
+        assert window.btn_pause_record.isEnabled() is False
+        assert window.btn_pause_record.text() == "暂停录制"
+
+    def test_editing_blocked_while_paused(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        window.toggle_recording_pause()
+        assert window.state is State.RECORD_PAUSED
+        assert window.btn_start_record.isEnabled() is False
+        assert window.btn_new_script.isEnabled() is False
+        assert window.btn_clear.isEnabled() is False
+        window.stop_recording()
+        _pump(qapp, 80)
+
+    def test_pulse_stops_while_paused(self, window, qapp, monkeypatch):
+        self._start(window, monkeypatch)
+        assert window.sidebar.btn_record._anim.state() != 0
+        window.toggle_recording_pause()
+        assert window.sidebar.btn_record._pulse == 0.0
+        window.stop_recording()
+        _pump(qapp, 80)
 
 
 # ===========================================================================
@@ -884,7 +962,7 @@ class TestScriptLibrary:
 
     def test_delete_script(self, window, qapp, monkeypatch):
         paths = self._seed(window, qapp, ["要删除的"])
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.Yes))
         window.page_library.select_path(paths[0])
         window.delete_selected_script()
@@ -894,7 +972,7 @@ class TestScriptLibrary:
 
     def test_delete_script_cancelled(self, window, qapp, monkeypatch):
         paths = self._seed(window, qapp, ["保留的"])
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.No))
         window.page_library.select_path(paths[0])
         window.delete_selected_script()
@@ -2905,7 +2983,7 @@ class TestUnsavedGuards:
 
         self._make_dirty(window, qapp)
         calls: list = []
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: calls.append(a) or QMessageBox.Cancel))
         monkeypatch.setattr("ui.main_window.ask_name", lambda *a, **k: "不该创建")
         window.create_script()
@@ -2921,7 +2999,7 @@ class TestUnsavedGuards:
         ep.save_script(path, "另一个", _sample_events())
         self._make_dirty(window, qapp)
         calls: list = []
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: calls.append(a) or QMessageBox.Cancel))
         window.load_script_file  # noqa: B018 - 仅确认存在
         before = list(window._script_events)
@@ -2935,7 +3013,7 @@ class TestUnsavedGuards:
 
         self._make_dirty(window, qapp)
         window.set_script_name("未保存确认测试")
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.Save))
         assert window._confirm_discard_unsaved("新建脚本") is True
         assert (window.config.scripts_path() / "未保存确认测试.json").exists()
@@ -2946,7 +3024,7 @@ class TestUnsavedGuards:
 
         _load_into_window(window, _sample_events())
         window._unsaved = False
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: pytest.fail("不应弹确认框")))
         assert window._confirm_discard_unsaved("新建脚本") is True
 
@@ -2963,7 +3041,7 @@ class TestUnsavedGuards:
         window.set_script_name("已存在的脚本")
 
         calls: list = []
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: calls.append(a) or QMessageBox.No))
         result = window.save_script()
         assert result is None, "用户拒绝覆盖时不应保存"
@@ -2980,7 +3058,7 @@ class TestUnsavedGuards:
         _load_into_window(window, _sample_events())
         window._current_script = None
         window.set_script_name("覆盖目标")
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.Yes))
         result = window.save_script()
         assert result is not None
@@ -2994,9 +3072,90 @@ class TestUnsavedGuards:
         window.set_script_name("当前脚本")
         path = window.save_script()
         assert path is not None
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: pytest.fail("不应弹确认框")))
         assert window.save_edited_steps() == path
+
+
+# ===========================================================================
+# 空脚本录制 / 默认名静默保存（v1.2.0 弹窗优化）
+# ===========================================================================
+class TestEmptyScriptFlow:
+    def test_record_empty_script_does_not_prompt(self, window, qapp, monkeypatch):
+        """新建空脚本（0 步）点「开始录制」不该弹「覆盖现有步骤」确认。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        monkeypatch.setattr(window.recorder, "start", lambda **kwargs: True)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        # 空脚本：无步骤，但有「已加载脚本」的文件句柄
+        window._script_steps = []
+        window._script_events = []
+        window._current_script = window.config.scripts_path() / "空脚本.json"
+
+        called = []
+        monkeypatch.setattr("ui.main_window.ask_question",
+                            staticmethod(lambda *a, **k: called.append(a)))
+        window.start_recording()
+        assert called == [], "空脚本开始录制不应弹覆盖确认"
+        assert window.state is State.RECORDING
+        window.stop_recording()
+        _pump(qapp, 80)
+
+    def test_record_nonempty_script_prompts(self, window, qapp, monkeypatch):
+        """有真实步骤时开始录制仍应弹覆盖确认。"""
+        monkeypatch.setattr(window.recorder, "start", lambda **kwargs: True)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        _load_into_window(window, _sample_events())
+
+        called = []
+        monkeypatch.setattr(window, "_confirm_replace_for_record",
+                            lambda: called.append(True) or False)
+        window.start_recording()
+        assert called, "有步骤时开始录制应弹覆盖确认"
+        assert window.state is not State.RECORDING  # 用户取消后不进入录制
+
+    def test_default_name_save_is_silent(self, window, qapp, monkeypatch):
+        """默认名「录制-YYYYMMDD-HHMMSS」保存时静默覆盖，不弹确认。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        _load_into_window(window, _sample_events())
+        window._current_script = None
+        window.set_script_name("录制-20261101-114254")
+
+        # 预先放置同名文件，模拟同秒重复录制
+        existing = window.config.scripts_path() / "录制-20261101-114254.json"
+        ep.save_script(existing, "录制-20261101-114254", [])
+
+        monkeypatch.setattr("ui.main_window.ask_question",
+                            staticmethod(lambda *a, **k: pytest.fail("默认名保存不应弹窗")))
+        result = window.save_script()
+        assert result is not None
+        assert len(ep.load_script(result)["events"]) == len(_sample_events())
+
+    def test_custom_name_save_still_prompts(self, window, qapp, monkeypatch):
+        """用户自定义名保存到已存在的同名脚本时，仍应弹确认。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        directory = window.config.scripts_path()
+        existing = directory / "我的脚本.json"
+        ep.save_script(existing, "我的脚本", _sample_events())
+
+        _load_into_window(window, _sample_events())
+        window._current_script = None
+        window.set_script_name("我的脚本")
+
+        calls = []
+        monkeypatch.setattr("ui.main_window.ask_question",
+                            staticmethod(lambda *a, **k: calls.append(a) or QMessageBox.No))
+        assert window.save_script() is None
+        assert calls, "自定义名覆盖前应确认"
+
+    def test_is_default_script_name(self, window):
+        assert window._is_default_script_name("录制-20261101-114254") is True
+        assert window._is_default_script_name("录制-20261101-114254") is True
+        assert window._is_default_script_name("我的脚本") is False
+        assert window._is_default_script_name("") is True
+        assert window._is_default_script_name("录制-2026abc-114254") is False
 
 
 # ===========================================================================
@@ -3004,7 +3163,7 @@ class TestUnsavedGuards:
 # ===========================================================================
 class TestWindowGeometry:
     def test_geometry_saved_on_close(self, qapp, config, monkeypatch):
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.Discard))
         win = MainWindow(config)
         win.show()
@@ -3024,7 +3183,7 @@ class TestWindowGeometry:
         assert reloaded.get("window.height") == actual_geo.height()
 
     def test_out_of_range_position_centered(self, qapp, config, monkeypatch):
-        monkeypatch.setattr(QMessageBox, "question",
+        monkeypatch.setattr("ui.main_window.ask_question",
                             staticmethod(lambda *a, **k: QMessageBox.Discard))
         config.set("window.x", 99999)
         config.set("window.y", 99999)
