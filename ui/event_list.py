@@ -2,8 +2,8 @@
 
 界面结构（整体是一张白色卡片）::
 
-    ┌ 步骤编辑 共 12 步  [已选 3 步]                     ─────────────┐
-    │ [全选] [反选]  │  [删除] [上移] [下移] [插入]  │  [保存] │
+    ┌ 步骤编辑 共 12 步  [已选 3 步]                                 ┐
+    │ [全选] [反选] [类型▾] [全选此类型] │ [删除] [上移] [下移] [插入] [保存] │
     ├────────────────────────────────────────────────────────────────┤
     │ ☑ 序号 类型     内容                        时间              │
     │ ☑  1   鼠标移动 移动到 (640, 400)            0.000s → 0.090s  │
@@ -12,17 +12,32 @@
 
 * 「当前执行行」用浅蓝底 + 左侧蓝色竖条高亮（模式一/模式二回放时同步）
 * 勾选行用极浅蓝底表示；复选框列点击即可切换
+* **按类型全选**：下拉选类型 → 点「全选此类型」= 先清空勾选，再勾中该类型
+* **框选**：按住左键拖过若干行，行高亮的同时复选框自动勾上
 * 编辑动作本身不在这里实现，全部通过信号交给主窗口处理
+
+批量勾选有四条路径，互不冲突：
+
+* 点行首复选框 —— 切换这一行的勾选（``_on_cell_clicked``）
+* 点行的其它列 —— 清空全部勾选，只留焦点行（``_on_cell_clicked``）
+* 按住左键拖过若干行 —— 这些行高亮**并**勾上，以框为准
+  （``eventFilter`` 记录拖动状态 + ``_on_table_selection_changed`` 同步勾选）
+* 点列表空白处 —— 高亮解除 + 勾选全部取消（``eventFilter``）
+
+关键点：Qt 的行选中态（``ExtendedSelection``）只服务于「框选」这一个手势。
+单击产生的行选中会被立刻清掉，否则「点一下行身」会留下一行蓝色高亮却
+没有勾选，看起来像状态错乱。
 """
 
 
 from typing import Any, Optional, Sequence
 
-from PySide6.QtCore import QEvent, QModelIndex, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (QEvent, QItemSelectionModel, QModelIndex, QRectF,
+                            QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView,
-                               QLabel, QMenu, QPushButton, QStyle,
-                               QStyledItemDelegate, QTableWidget,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QHBoxLayout,
+                               QHeaderView, QLabel, QMenu, QPushButton,
+                               QStyle, QStyledItemDelegate, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core import event_parser as ep
@@ -38,6 +53,20 @@ ROLE_CHECKED = Qt.UserRole + 1
 ROLE_CURRENT = Qt.UserRole + 2
 ROLE_FOCUS = Qt.UserRole + 3
 
+#: 「按类型全选」下拉的条目（顺序即下拉中的显示顺序）
+KIND_CHOICES: tuple[tuple[str, str], ...] = (
+    ("move", "鼠标移动"),
+    ("click", "鼠标点击"),
+    ("scroll", "鼠标滚轮"),
+    ("key", "键盘按键"),
+    ("combo", "组合键"),
+    ("multi", "鼠标连击"),
+)
+
+#: 框选高亮色：比勾选行（#F7F9FF）明显、比「当前执行行」（ACCENT_LIGHT）浅一档，
+#: 保证「框选中 / 已勾选 / 正在执行」三种底色一眼能分开。
+_SELECTED_BG = "#E6EFFF"
+
 
 class _RowDelegate(QStyledItemDelegate):
     """行背景 + 复选框的自绘代理。
@@ -52,6 +81,9 @@ class _RowDelegate(QStyledItemDelegate):
         checked = bool(index.data(ROLE_CHECKED))
         current = bool(index.data(ROLE_CURRENT))
         focused = bool(index.data(ROLE_FOCUS))
+        # 框选产生的行选中态：必须在清掉 State_Selected 之前读出来，
+        # 否则 Windows 原生样式会画一层蓝底 + 蓝色焦点框，和自绘配色打架。
+        selected = bool(option.state & QStyle.State_Selected)
 
         # 清掉焦点/选中状态，避免 Windows 原生样式再画一圈蓝色焦点框
         option.state &= ~QStyle.State_HasFocus
@@ -61,8 +93,11 @@ class _RowDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         # ---------------- 行底色 ----------------
+        # 优先级：当前执行行 > 框选行 > 已勾选行 > 焦点行
         if current:
             base = QColor(styles.ACCENT_LIGHT)
+        elif selected:
+            base = QColor(_SELECTED_BG)
         elif checked:
             base = QColor("#F7F9FF")
         elif focused:
@@ -147,6 +182,7 @@ class EventListWidget(QWidget):
     row_activated = Signal(int)          # 双击某行（传入步骤下标）
     edit_requested = Signal(str)         # 工具栏动作名
     selection_changed = Signal(int)      # 当前勾选数量
+    hint = Signal(str)                   # 给主窗口状态栏的一句提示（框选/类型全选）
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -154,6 +190,16 @@ class EventListWidget(QWidget):
         self._checked: set[int] = set()
         self._current_row = -1      # 「当前执行行」（回放时高亮）
         self._focus_row = -1        # 「界面焦点行」（用户点击/方向键选中的行）
+        # —— 框选（鼠标拖选）相关的状态机 ——
+        # ``_drag_active``：本次按下之后是否已经拖出了距离（决定 Qt 的行选中
+        #   要不要同步成复选框勾选）；``_drag_just_ended``：刚结束一次拖选，
+        #   用来吞掉拖选尾随的那一次 ``cellClicked``；``_syncing``：正在用代码
+        #   改 Qt 选中态，屏蔽 ``itemSelectionChanged`` 回调，避免自激。
+        self._drag_active = False
+        self._drag_just_ended = False
+        self._drag_press_pos = None
+        self._syncing = False
+        self._editing_enabled = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -195,6 +241,20 @@ class EventListWidget(QWidget):
         # 不再提供「取消选择」按钮：点击任何非复选框区域即自动清除勾选
         for btn in (self.btn_select_all, self.btn_invert):
             toolbar1.addWidget(btn)
+
+        # —— 按类型一键全选：先清空全部勾选，再勾选目标类型的全部步骤 ——
+        self.kind_combo = QComboBox(self)
+        self.kind_combo.setObjectName("KindFilter")
+        for kind, label in KIND_CHOICES:
+            self.kind_combo.addItem(label, kind)
+        self.kind_combo.setMinimumWidth(104)
+        self.kind_combo.setCursor(Qt.PointingHandCursor)
+        self.kind_combo.setToolTip("要批量勾选的步骤类型（鼠标移动 / 点击 / 滚轮 / 键盘 / 组合键 / 连击）")
+        self.btn_select_kind = self._tool_button(
+            "全选此类型", icons.ICON_CHECK_ALL,
+            "先清空当前勾选，再勾选列表里所有该类型的步骤", secondary=True)
+        toolbar1.addWidget(self.kind_combo)
+        toolbar1.addWidget(self.btn_select_kind)
 
         toolbar1.addWidget(self._separator())
 
@@ -245,7 +305,9 @@ class EventListWidget(QWidget):
         self.table.setWordWrap(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # 扩展选择：按住左键拖过若干行 = 框选（视图自带橡皮筋/范围选择），
+        # 拖选结果会在 _on_table_selection_changed 里同步成复选框勾选。
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setFocusPolicy(Qt.StrongFocus)
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.setMinimumHeight(170)
@@ -261,10 +323,10 @@ class EventListWidget(QWidget):
         # 这里清空 QTableWidget::item 的样式，避免它覆盖代理画出来的行底色。
         self._delegate = _RowDelegate(self.table)
         self.table.setItemDelegate(self._delegate)
-        self.table.setSelectionMode(QAbstractItemView.NoSelection)
-        # 完全自管「焦点行」：不用 Qt 的 current cell，
-        # 这样 Windows 原生样式就不会再画一圈蓝色焦点框。
-        self.table.setFocusPolicy(Qt.NoFocus)
+        # 「焦点行」仍由自己管（不用 Qt 的 current cell 来决定长什么样）：
+        # 代理里会清掉 State_HasFocus / State_Selected，所以即使表格拿焦点，
+        # Windows 原生样式也不会再画蓝色焦点框和蓝底选中块。
+        self.table.setFocusPolicy(Qt.StrongFocus)
         self.table.setStyleSheet(
             "QTableWidget#EventTable, QTableWidget#EventTable::item "
             "{ outline: none; padding: 0px; border: none; }"
@@ -282,8 +344,12 @@ class EventListWidget(QWidget):
         self.table.setColumnWidth(COL_TIME, 190)
 
         self.table.cellClicked.connect(self._on_cell_clicked)
+        # 框选：视图自己维护行选中态，这里把它翻译成复选框勾选
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         # 空白处点击不会触发 cellClicked，需要在 viewport 上补一次拦截
         self.table.viewport().installEventFilter(self)
+        # 表格本身也要拦键盘：改成 StrongFocus 后方向键/空格会被 QTableView 吃掉
+        self.table.installEventFilter(self)
         self.table.doubleClicked.connect(self._on_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
@@ -299,6 +365,7 @@ class EventListWidget(QWidget):
         # 信号接线
         self.btn_select_all.clicked.connect(self.select_all)
         self.btn_invert.clicked.connect(self.invert_selection)
+        self.btn_select_kind.clicked.connect(self.select_by_kind)
         self.btn_delete.clicked.connect(self._emit_delete)
         self.btn_up.clicked.connect(lambda: self._emit_move(-1))
         self.btn_down.clicked.connect(lambda: self._emit_move(1))
@@ -365,6 +432,7 @@ class EventListWidget(QWidget):
         self._reindex()
         self._checked.clear()
         self._current_row = -1
+        self._clear_table_selection()
         self._rebuild()
 
     def set_events(self, events: Sequence[dict[str, Any]],
@@ -377,6 +445,7 @@ class EventListWidget(QWidget):
         self._steps = []
         self._checked.clear()
         self._current_row = -1
+        self._clear_table_selection()
         self._rebuild()
 
     def _reindex(self) -> None:
@@ -425,22 +494,44 @@ class EventListWidget(QWidget):
 
     def select_all(self) -> None:
         self._checked = set(range(len(self._steps)))
+        self._clear_table_selection()
         self._refresh_check_column()
         self._update_toolbar()
 
+    def select_by_kind(self) -> None:
+        """先清空勾选，再勾选下拉里选中的那一种类型（其余类型不保留）。"""
+        kind = self.kind_combo.currentData()
+        label = self.kind_combo.currentText()
+        if not kind:
+            return
+        self._checked = {i for i, step in enumerate(self._steps)
+                         if step.kind == kind}
+        self._refresh_check_column()
+        self._update_toolbar()
+        if self._checked:
+            self.hint.emit(f"已按类型全选：勾选 {len(self._checked)} 步「{label}」"
+                           f"（其余类型的勾选已清空）")
+        elif self._steps:
+            self.hint.emit(f"当前列表里没有「{label}」类型的步骤。")
+        else:
+            self.hint.emit("步骤列表是空的，先录制或载入一个脚本。")
+
     def clear_selection(self) -> None:
         self._checked.clear()
+        self._clear_table_selection()
         self._refresh_check_column()
         self._update_toolbar()
 
     def invert_selection(self) -> None:
         self._checked = {i for i in range(len(self._steps)) if i not in self._checked}
+        self._clear_table_selection()
         self._refresh_check_column()
         self._update_toolbar()
 
     def set_checked(self, indices: Sequence[int]) -> None:
         """外部设置勾选（编辑后恢复选择状态用）。"""
         self._checked = {i for i in indices if 0 <= i < len(self._steps)}
+        self._clear_table_selection()
         self._refresh_check_column()
         self._update_toolbar()
 
@@ -453,6 +544,52 @@ class EventListWidget(QWidget):
             self._checked.add(row)
         self._refresh_check_column()
         self._update_toolbar()
+
+    # ---- 框选（Qt 行选中）→ 复选框勾选 ----
+    def selected_rows(self) -> list[int]:
+        """表格里当前被 Qt 选中的行（升序）。框选高亮用的就是这个集合。"""
+        model = self.table.selectionModel()
+        if model is None:
+            return []
+        return sorted(index.row() for index in model.selectedRows(COL_DESC))
+
+    def _clear_table_selection(self) -> None:
+        """清掉框选高亮（不动 ``_checked``，避免误触发同步回调）。"""
+        if self.table.selectionModel() is None:
+            return
+        self._syncing = True
+        try:
+            self.table.clearSelection()
+        finally:
+            self._syncing = False
+
+    def _on_table_selection_changed(self) -> None:
+        """把框选出来的行同步成勾选状态。
+
+        只在「用户按住左键拖过」的时候同步（``_drag_active``）：单击产生的
+        行选中不改变勾选，保持「点行身 = 清空勾选、只留焦点行」的老手感。
+        """
+        if self._syncing or not self._drag_active or not self._editing_enabled:
+            return
+        rows = set(self.selected_rows())
+        if not rows or rows == self._checked:
+            return
+        self._checked = rows
+        self._refresh_check_column()
+        self._update_toolbar()
+
+    def _finish_drag(self) -> None:
+        """拖选收尾：撤销拖选标记，并在状态栏说一句结果。
+
+        ``_drag_just_ended`` 必须在这里清掉：视图的 ``mouseReleaseEvent`` 是
+        同步执行的，等这个 0ms 定时器跑起来时，拖选尾随的那次 ``clicked``
+        早就发完了。留着它只会让用户的下一次单击被白白吃掉。
+        """
+        with_click = self._drag_just_ended
+        self._drag_active = False
+        self._drag_just_ended = False
+        if with_click and self._checked:
+            self.hint.emit(f"框选 {len(self._checked)} 步，复选框已同步勾选。")
 
     # ==================================================================
     # 信号发出
@@ -654,25 +791,90 @@ class EventListWidget(QWidget):
         勾选是为批量操作服务的临时状态，点到别处就失效——符合「点哪里
         就只关注哪里」的直觉。正因如此，工具栏不再需要单独的「取消选择」。
         """
+        if self._drag_just_ended:
+            # 框选结束时视图可能还会补发一次 clicked，别让它把刚同步好的
+            # 复选框又清掉（这是「框选」和「单击」两种交互唯一的冲突点）。
+            self._drag_just_ended = False
+            return
         self.set_focus_row(row)
         if column == COL_CHECK:
             self.toggle_row(row)
         elif self._checked:
             self.clear_selection()
+        # 单击不保留框选高亮：行选中态只服务于「框选」这一个手势
+        self._clear_table_selection()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        """点击列表空白处（没有命中任何行）时同样清空勾选。
+        """viewport 上的鼠标事件：框选状态机 + 点击空白处清空勾选。
 
         ``cellClicked`` 只在有效单元格上触发，表格下方留白不会发出信号，
-        所以额外在 viewport 上拦一次鼠标按下。
+        所以额外在 viewport 上拦一次鼠标按下。拖选的方向、范围、橡皮筋
+        全部交给 ``QAbstractItemView`` 自己处理，这里只负责：
+
+        * 记录「本次按下之后是否真的拖过」（决定要不要同步复选框）
+        * 空白处按下 → 解除高亮 + 清空勾选
+        * 松手后延后一拍收尾，并在状态栏说一句框选结果
         """
-        if (watched is self.table.viewport()
-                and event.type() == QEvent.MouseButtonPress
-                and event.button() == Qt.LeftButton
-                and not self.table.indexAt(event.pos()).isValid()
-                and self._checked):
-            self.clear_selection()
+        if watched is self.table.viewport():
+            etype = event.type()
+            if etype not in (QEvent.MouseButtonPress, QEvent.MouseMove,
+                             QEvent.MouseButtonRelease):
+                # 视口上还有绘制/滚动等一堆事件，别在这里碰鼠标 API
+                return super().eventFilter(watched, event)
+            pos = event.position().toPoint()
+            if etype == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._drag_active = False
+                self._drag_just_ended = False
+                self._drag_press_pos = pos
+                if (not self.table.indexAt(pos).isValid() and self._checked):
+                    self.clear_selection()
+            elif etype == QEvent.MouseMove and self._drag_press_pos is not None:
+                if (event.buttons() & Qt.LeftButton
+                        and (pos - self._drag_press_pos).manhattanLength() >= 4):
+                    self._drag_active = True
+            elif (etype == QEvent.MouseButtonRelease
+                  and event.button() == Qt.LeftButton):
+                self._drag_press_pos = None
+                if self._drag_active:
+                    self._drag_just_ended = True
+                # 视图会在本事件之后再动一次选中态，延后一拍再收尾
+                QTimer.singleShot(0, self._finish_drag)
+        elif watched is self.table and event.type() == QEvent.KeyPress:
+            if self._handle_table_key(event):
+                return True
         return super().eventFilter(watched, event)
+
+    def _handle_table_key(self, event) -> bool:
+        """表格拿到焦点时的键盘操作：空格切换勾选、上下方向键移动焦点行。
+
+        表格从 ``NoFocus`` 改成 ``StrongFocus``（框选要用）之后，箭头和空格
+        会被 ``QTableView`` 自己处理掉：方向键会在不勾选的情况下留下一条蓝色
+        「选中」行，空格则去切换 Qt 的选中态。这里统一接管，保证界面上
+        「高亮 = 勾选」的语义不被键盘破坏。
+        """
+        key = event.key()
+        if key == Qt.Key_Space:
+            row = self._focus_row
+            if not (0 <= row < len(self._steps)):
+                row = self.table.currentRow()
+            if 0 <= row < len(self._steps):
+                self.set_focus_row(row)
+                self.toggle_row(row)
+            return True
+        if key in (Qt.Key_Up, Qt.Key_Down):
+            row = self._focus_row
+            if row < 0:
+                row = self.table.currentRow()
+            if key == Qt.Key_Up:
+                row = max(0, row - 1)
+            else:
+                row = min(len(self._steps) - 1, row + 1)
+            self.set_focus_row(row)
+            if 0 <= row < self.table.rowCount():
+                self.table.scrollTo(self.table.model().index(row, COL_DESC))
+            self._clear_table_selection()
+            return True
+        return False
 
     def _on_double_clicked(self, index) -> None:
         """双击：时间列 -> 编辑步骤（含时间）；其它列 -> 跳步执行。"""
@@ -730,6 +932,8 @@ class EventListWidget(QWidget):
         count = self.checked_count
         self.btn_select_all.setEnabled(has_steps and count < len(self._steps))
         self.btn_invert.setEnabled(has_steps)
+        self.kind_combo.setEnabled(has_steps and self._editing_enabled)
+        self.btn_select_kind.setEnabled(has_steps and self._editing_enabled)
         self.btn_delete.setEnabled(count > 0)
         self.btn_up.setEnabled(count > 0)
         self.btn_down.setEnabled(count > 0)
@@ -749,7 +953,12 @@ class EventListWidget(QWidget):
     def set_editing_enabled(self, enabled: bool) -> None:
         """录制/回放过程中禁用编辑动作，避免中途改到正在执行的数据。"""
         self._editing_enabled = enabled
+        if not enabled:
+            # 录制/回放中不允许出现"框选高亮"，否则看起来像可编辑状态
+            self._drag_active = False
+            self._clear_table_selection()
         for button in (self.btn_select_all, self.btn_invert,
+                       self.btn_select_kind, self.kind_combo,
                        self.btn_delete, self.btn_up, self.btn_down,
                        self.btn_insert, self.btn_save,
                        self.btn_duration, self.btn_edit_step):

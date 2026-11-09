@@ -26,6 +26,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QElapsedTimer, QPoint, QTimer, Qt    # noqa: E402
+from PySide6.QtTest import QTest                                  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 
 from core import event_parser as ep                              # noqa: E402
@@ -3436,3 +3437,179 @@ class TestAppendRecording:
         assert window._script_events == []
         window.stop_recording()
         _pump(qapp, 60)
+
+
+# ===========================================================================
+# 批量选择：按类型全选 + 鼠标框选
+# ===========================================================================
+class TestBatchSelection:
+    """「全选此类型」与「按住左键框选」两种批量勾选方式。
+
+    四种交互（框选 / 按类型全选 / 单击 / 点空白）互不打架，是本类的核心断言。
+    """
+
+    def _prepare(self, window, qapp):
+        _load_into_window(window, _sample_events())
+        _install_null_controllers(window)
+        _pump(qapp, 60)
+        return window.event_list
+
+    @staticmethod
+    def _rows_of_kind(editor, kind: str) -> list[int]:
+        return [i for i, step in enumerate(editor.steps) if step.kind == kind]
+
+    def _drag_rows(self, editor, first: int, last: int) -> None:
+        """从 first 行拖到 last 行（真实鼠标事件，走 viewport 事件过滤器）。"""
+        from ui.event_list import COL_DESC
+
+        table = editor.table
+        start = table.visualItemRect(table.item(first, COL_DESC)).center()
+        end = table.visualItemRect(table.item(last, COL_DESC)).center()
+        QTest.mousePress(table.viewport(), Qt.LeftButton, Qt.NoModifier, start)
+        QTest.mouseMove(table.viewport(), start + QPoint(0, 10))
+        QTest.mouseMove(table.viewport(), end)
+        QTest.mouseRelease(table.viewport(), Qt.LeftButton, Qt.NoModifier, end)
+
+    # ---------------- 任务 1：按类型全选 ----------------
+    def test_kind_combo_lists_all_step_kinds(self, window, qapp):
+        """下拉里六种类型齐全，且每项都带 kind 数据。"""
+        from ui.event_list import KIND_CHOICES
+
+        editor = self._prepare(window, qapp)
+        combo = editor.kind_combo
+        assert combo.count() == len(KIND_CHOICES) == 6
+        assert [combo.itemData(i) for i in range(combo.count())] == \
+            [kind for kind, _ in KIND_CHOICES]
+        assert combo.itemText(0) == "鼠标移动"
+
+    def test_select_by_kind_checks_only_that_kind(self, window, qapp):
+        """先清空再全选：只勾中目标类型，别的类型一个都不留。"""
+        editor = self._prepare(window, qapp)
+        clicks = self._rows_of_kind(editor, "click")
+        assert clicks, "样例事件里应该有鼠标点击步骤"
+        editor.set_checked([0])                     # 先随便勾一个别的类型
+        assert 0 not in clicks
+
+        editor.kind_combo.setCurrentIndex(1)        # 鼠标点击
+        editor.select_by_kind()
+        _pump(qapp, 40)
+        assert editor.checked_indices() == clicks
+        assert "已按类型全选" in window.message_label.text()
+        assert "鼠标点击" in window.message_label.text()
+
+    def test_select_by_kind_enables_batch_buttons(self, window, qapp):
+        """勾上之后「删除 / 编辑这一步」必须变可用，否则批量操作无从下手。"""
+        editor = self._prepare(window, qapp)
+        assert not editor.btn_delete.isEnabled()
+        editor.kind_combo.setCurrentIndex(0)        # 鼠标移动
+        editor.select_by_kind()
+        _pump(qapp, 40)
+        assert editor.checked_count > 0
+        assert editor.btn_delete.isEnabled()
+        assert editor.btn_edit_step.isEnabled()
+        assert "已选" in editor.selection_label.text()
+
+    def test_select_by_kind_without_matches_hints(self, window, qapp):
+        """选了个列表里没有的类型：勾选为空 + 给一句提示，不能静默无反应。"""
+        editor = self._prepare(window, qapp)
+        editor.set_checked([0])
+        index = editor.kind_combo.findData("multi")   # 样例里没有连击
+        editor.kind_combo.setCurrentIndex(index)
+        editor.select_by_kind()
+        _pump(qapp, 40)
+        assert editor.checked_count == 0
+        assert not editor.btn_delete.isEnabled()
+        assert "没有" in window.message_label.text()
+
+    # ---------------- 任务 2：鼠标框选 ----------------
+    def test_table_uses_row_extended_selection(self, window, qapp):
+        """表格必须开着「整行 + 扩展选择」，否则橡皮筋拖动根本不会出现。"""
+        from PySide6.QtWidgets import QAbstractItemView
+
+        editor = self._prepare(window, qapp)
+        assert editor.table.selectionBehavior() == QAbstractItemView.SelectRows
+        assert editor.table.selectionMode() == QAbstractItemView.ExtendedSelection
+
+    def test_drag_select_checks_every_touched_row(self, window, qapp):
+        """框选 0~2 行：高亮 + 复选框同步勾选 + 状态栏报数量。"""
+        editor = self._prepare(window, qapp)
+        editor.clear_selection()
+        assert editor.checked_count == 0
+
+        self._drag_rows(editor, 0, 2)
+        _pump(qapp, 40)
+        assert editor.selected_rows() == [0, 1, 2]
+        assert editor.checked_indices() == [0, 1, 2]
+        assert editor.btn_delete.isEnabled()
+        assert "框选 3 步" in window.message_label.text()
+
+    def test_drag_select_replaces_previous_checks(self, window, qapp):
+        """框选是「以框为准」：上一次的勾选不会残留，避免误删。"""
+        editor = self._prepare(window, qapp)
+        editor.set_checked([4])
+        self._drag_rows(editor, 0, 1)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == [0, 1]
+
+    def test_single_click_clears_checks_and_highlight(self, window, qapp):
+        """框选之后再单击行身：勾选与高亮一并清掉（老逻辑不能丢）。"""
+        from ui.event_list import COL_DESC
+
+        editor = self._prepare(window, qapp)
+        self._drag_rows(editor, 0, 2)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == [0, 1, 2]
+
+        editor._on_cell_clicked(1, COL_DESC)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == []
+        assert editor.selected_rows() == []
+        assert not editor.btn_delete.isEnabled()
+
+    def test_drag_end_does_not_swallow_next_click(self, window, qapp):
+        """框选收尾时视图可能补发一次 clicked——不能把用户的下一次点击吃掉。"""
+        from ui.event_list import COL_DESC
+
+        editor = self._prepare(window, qapp)
+        self._drag_rows(editor, 0, 2)
+        _pump(qapp, 60)          # 让拖选收尾的 0ms 定时器跑完
+        editor._on_cell_clicked(1, COL_DESC)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == []
+        # 再来一次单击：如果上一次被"拖选守卫"吞了，这里就还原不了任何状态
+        editor.set_checked([2])
+        editor._on_cell_clicked(0, COL_DESC)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == []
+
+    def test_blank_click_clears_checks_and_highlight(self, window, qapp):
+        """点列表空白处：高亮解除 + 复选框全部取消（保持原有逻辑）。"""
+        editor = self._prepare(window, qapp)
+        self._drag_rows(editor, 0, 1)
+        _pump(qapp, 40)
+        assert editor.checked_count == 2
+
+        table = editor.table
+        blank = QPoint(40, table.viewport().height() - 6)
+        QTest.mousePress(table.viewport(), Qt.LeftButton, Qt.NoModifier, blank)
+        QTest.mouseRelease(table.viewport(), Qt.LeftButton, Qt.NoModifier, blank)
+        _pump(qapp, 40)
+        assert editor.checked_indices() == []
+        assert editor.selected_rows() == []
+
+    def test_keyboard_space_toggles_row_without_stray_highlight(self, window, qapp):
+        """表格拿焦点后：↓ 只移焦点（不留蓝色选中行），空格切换该行勾选。"""
+        editor = self._prepare(window, qapp)
+        editor.clear_selection()
+        table = editor.table
+        table.setFocus()
+
+        QTest.keyClick(table, Qt.Key_Down)
+        _pump(qapp, 30)
+        assert editor.selected_rows() == []
+        assert editor._focus_row >= 0
+
+        row = editor._focus_row
+        QTest.keyClick(table, Qt.Key_Space)
+        _pump(qapp, 30)
+        assert editor.checked_indices() == [row]

@@ -335,6 +335,14 @@ QComboBox QAbstractItemView {{
     selection-color: {TEXT};
     outline: none;
 }}
+/* 步骤编辑器工具栏里的「类型」下拉：要和 28px 高的工具栏按钮齐平，
+   所以比全局 QComboBox 收掉左右内边距；上下沿用按钮的 6px + 20px 行高，
+   两边算出来的总高度都是 34px（20 行高 + 12 内边距 + 2 边框）。
+   （箭头形状沿用全局 QComboBox::down-arrow，全应用一致，不在这里单独改。） */
+QComboBox#KindFilter {{
+    padding: 6px 8px;
+    min-height: 20px;
+}}
 
 /* QSpinBox 上下调节按钮：覆盖原生灰色箭头，改成圆角浅灰小按钮 */
 QSpinBox, QDoubleSpinBox {{

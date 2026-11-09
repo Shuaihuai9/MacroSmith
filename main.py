@@ -204,7 +204,7 @@ def run_startup_check(app, window, log) -> int:
 
     hotkeys = window.hotkeys.display_map()
     from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QWidget
+    from PySide6.QtWidgets import QAbstractItemView, QWidget
     from ui.main_window import PAGE_SCRIPTS
     from ui.styles import SIDEBAR_WIDTH, build_stylesheet
     from utils.win_utils import load_app_icon
@@ -274,6 +274,12 @@ def run_startup_check(app, window, log) -> int:
                         and window.btn_append_record.isEnabled()
                         == bool(window._script_steps)),
          "有步骤时可用、空脚本禁用；新步骤接在末尾，原有步骤不动"),
+        ("步骤批量选择", (window.event_list.kind_combo.count() == 6
+                    and window.event_list.table.selectionBehavior()
+                    == QAbstractItemView.SelectRows
+                    and window.event_list.table.selectionMode()
+                    == QAbstractItemView.ExtendedSelection),
+         "类型下拉 6 种 + 「全选此类型」；表格整行扩展选择，可按住左键框选"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

@@ -540,6 +540,8 @@ class MainWindow(WindowShell):
         # 步骤编辑器
         self.event_list.row_activated.connect(self._on_row_activated)
         self.event_list.edit_requested.connect(self._on_edit_action)
+        # 框选 / 按类型全选的结果由列表自己算，主窗口只负责把提示显示到状态栏
+        self.event_list.hint.connect(self._set_message)
 
         # 「回放与脚本」页（原脚本库）
         self.page_library.create_requested.connect(self.create_script)
@@ -1176,7 +1178,8 @@ class MainWindow(WindowShell):
 
         selected = self.event_list.checked_indices()
         if not selected:
-            self._set_message("请先勾选要操作的步骤（可点行首复选框，或用“全选”）。")
+            self._set_message("请先勾选要操作的步骤（点行首复选框、用「全选」或"
+                              "「全选此类型」，也可以直接在列表里按住左键框选）。")
             return
 
         if action == "delete":
