@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional, Sequence
 from pynput import keyboard, mouse
 
 from core import event_parser as ep
+from core import win_input
 from core.event_parser import Step
 from utils.win_utils import clamp_to_virtual_screen
 
@@ -47,6 +48,18 @@ _STEP_MAX_GAP_MS = 60
 #: 组合键也可能被前台程序当成「先按 Ctrl、再按 V」两次独立操作。
 #: 5ms 足以让系统按顺序处理，同时远小于双击判定窗口。
 _MERGED_STEP_MAX_GAP_MS = 5
+
+#: 插值移动步骤（模式二）的补帧间隔（毫秒）。
+#: 10~15ms 约等于 60~100fps，与真人移动的事件密度相当：再密会被系统
+#: 合并掉中间帧，hover 状态来不及生效；再疏轨迹就发顿。
+_INTERP_FRAME_GAP_MS = 12
+
+#: 落定延时（毫秒）：最后一次移动与随后的「按下」之间至少间隔这么久。
+#: Win32 菜单、悬停展开的工具栏要收到 ``WM_MOUSEMOVE`` 并处理完才会
+#: 高亮/展开子菜单；录制时末帧移动与按下往往只隔几毫秒，直接注入会变成
+#: 「菜单还没亮就点下去了」，表现为点击落空。这是系统响应时间的地板值，
+#: 不随回放速度缩放。
+_HOVER_SETTLE_MS = 50
 
 # ---------------------------------------------------------------------------
 # 循环回放（模式一）
@@ -137,6 +150,8 @@ class MacroPlayer:
         self._held_keys: set[str] = set()
         self._held_buttons: set[str] = set()
         self._last_move: Optional[tuple[int, int]] = None   # 指针已知位置（去重移动）
+        #: 最后一次真实注入移动的时刻（monotonic），用于按下前的落定延时
+        self._last_move_ts = 0.0
 
     # ==================================================================
     # 基础属性与查询
@@ -271,8 +286,15 @@ class MacroPlayer:
     # 控制器（延迟创建，便于测试时替换）
     # ==================================================================
     def _mouse_ctl(self) -> mouse.Controller:
+        """取鼠标控制器（移动走 SendInput，见 :mod:`core.win_input`）。
+
+        注意：这里刻意不用 pynput 默认的 ``mouse.Controller()`` ——
+        它的 ``position`` setter 内部是 ``SetCursorPos``，绕过 Windows
+        输入栈、不产生 pointer 输入，WinUI/XAML 应用（Win11 记事本、
+        资源管理器）的菜单悬停收不到任何有效输入。
+        """
         if self._mouse is None:
-            self._mouse = mouse.Controller()
+            self._mouse = win_input.make_sendinput_mouse()
         return self._mouse
 
     def _keyboard_ctl(self) -> keyboard.Controller:
@@ -648,11 +670,17 @@ class MacroPlayer:
             for offset, evt in enumerate(events):
                 if step.kind == "move":
                     if is_interp_move:
-                        # 自动补帧的移动：快速连续执行所有帧（间隔压缩到
-                        # _MERGED_STEP_MAX_GAP_MS），一步内平滑走到目标点
+                        # 自动补帧的移动：逐帧连续执行所有帧，一步内平滑走到目标点。
+                        # 帧间隔固定为 _INTERP_FRAME_GAP_MS，不要压到 5ms ——
+                        # 那样几十帧会在瞬间灌进输入队列，系统合并后中间的
+                        # hover 状态直接丢失（Win32 菜单尤其敏感）。
                         now_t = int(evt.get("t") or 0)
-                        wait_ms = min(_MERGED_STEP_MAX_GAP_MS,
-                                      max(0, now_t - last_t))
+                        gap = now_t - last_t
+                        # 帧时间戳有间隔就按记录节奏（封顶 12ms）；时间戳
+                        # 全一样（数据退化）时强制按常量铺开，否则几十帧
+                        # 会挤在同一毫秒里一次性灌进输入队列
+                        wait_ms = min(_INTERP_FRAME_GAP_MS, gap) if gap > 0 \
+                            else _INTERP_FRAME_GAP_MS
                         if wait_ms:
                             time.sleep(wait_ms / 1000.0 / max(self.speed, 0.1))
                         last_t = now_t
@@ -696,6 +724,9 @@ class MacroPlayer:
             self._dispatch_move(int(evt.get("x") or 0), int(evt.get("y") or 0))
         elif etype == "mouse_click":
             self._ensure_cursor_at(evt)
+            if evt.get("action") == "press":
+                # 落点与按下之间留一个悬停落定窗口（Win32 菜单/悬停工具栏必需）
+                self._settle_before_press()
             self._dispatch_button(str(evt.get("button") or "left"),
                                   evt.get("action") == "press")
         elif etype == "mouse_scroll":
@@ -737,6 +768,20 @@ class MacroPlayer:
         with self._guard():
             self._mouse_ctl().position = (safe_x, safe_y)
         self._last_move = (safe_x, safe_y)
+        self._last_move_ts = time.monotonic()
+
+    def _settle_before_press(self) -> None:
+        """「按下」之前留出落定时间，让目标程序处理完悬停。
+
+        只补足差额（距最后一次移动不足 :data:`_HOVER_SETTLE_MS` 时），
+        所以只有当「移动 → 立刻点击」时才会真正等待；离上一次移动
+        已经过去很久的点击不受任何影响，不会把整段脚本拖慢。
+        """
+        if not self._last_move_ts:
+            return
+        remain = _HOVER_SETTLE_MS / 1000.0 - (time.monotonic() - self._last_move_ts)
+        if remain > 0:
+            self._sleep_interruptible(remain)
 
     def _dispatch_button(self, button: str, pressed: bool) -> None:
         btn = {
@@ -854,6 +899,7 @@ class MacroPlayer:
         self._held_keys.clear()
         self._held_buttons.clear()
         self._last_move = None
+        self._last_move_ts = 0.0
 
     # ==================================================================
     # 回调

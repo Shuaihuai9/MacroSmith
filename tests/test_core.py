@@ -16,6 +16,8 @@ from pathlib import Path
 import pytest
 
 from core import event_parser as ep
+from core import player as pl
+from core import win_input
 from core.config import Config
 from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
                               WM_KEYDOWN, WM_KEYUP, KeyboardHook, hook_supported)
@@ -2821,3 +2823,191 @@ class TestPollRecorderLifecycle:
     def test_pause_vk_defaults_to_f11(self):
         assert PollRecorder().pause_vk == 0x7A
 
+
+
+# ---------------------------------------------------------------------------
+# 悬停回放：SendInput 注入 / 落定延时 / 补帧密度
+# ---------------------------------------------------------------------------
+class TestSendInputCoordinates:
+    """SendInput 的 0..65535 归一化换算。"""
+
+    def test_origin_maps_to_zero(self, monkeypatch):
+        monkeypatch.setattr(win_input, "virtual_screen_rect", lambda: (0, 0, 1920, 1080))
+        assert win_input.to_absolute_xy(0, 0) == (0, 0)
+
+    def test_bottom_right_maps_back_to_itself(self, monkeypatch):
+        """右下角像素不必等于 65535（65535 会落在同一个像素上），
+        关键是反算能回到原像素。"""
+        monkeypatch.setattr(win_input, "virtual_screen_rect", lambda: (0, 0, 1920, 1080))
+        nx, ny = win_input.to_absolute_xy(1919, 1079)
+        assert (nx * 1920 // 65536, ny * 1080 // 65536) == (1919, 1079)
+        assert win_input.to_absolute_xy(5000, 5000) == (65535, 65535)
+
+    def test_negative_virtual_origin(self, monkeypatch):
+        """副屏在左侧/上方时虚拟桌面原点为负，边缘像素要能正确定位。"""
+        monkeypatch.setattr(win_input, "virtual_screen_rect",
+                            lambda: (-1920, -200, 3840, 1280))
+        assert win_input.to_absolute_xy(-1920, -200) == (0, 0)
+        nx, ny = win_input.to_absolute_xy(1919, 1079)
+        assert (nx * 3840 // 65536, ny * 1280 // 65536) == (3839, 1279)
+
+    def test_round_trip_is_pixel_exact(self, monkeypatch):
+        """Windows 用 floor(norm*span/65536) 反算像素，正向必须向上取整。
+
+        用 round 会在大约 4% 的坐标上偏 1px（实测 5120 宽屏 45 点错 2 点）。
+        """
+        monkeypatch.setattr(win_input, "virtual_screen_rect", lambda: (0, 0, 5120, 2160))
+        for px in range(0, 5120, 137):
+            nx, _ = win_input.to_absolute_xy(px, 0)
+            assert nx * 5120 // 65536 == px, f"像素 {px} 反算不回原位"
+
+    def test_out_of_range_is_clamped(self, monkeypatch):
+        monkeypatch.setattr(win_input, "virtual_screen_rect", lambda: (0, 0, 1920, 1080))
+        assert win_input.to_absolute_xy(-500, 5000) == (0, 65535)
+
+
+class TestSendInputInjection:
+    """移动必须走 SendInput（带 MOVE|ABSOLUTE|VIRTUALDESK），不能是瞬移。"""
+
+    def test_flags_and_coordinates(self, monkeypatch):
+        captured = []
+
+        def fake_send(inp):
+            captured.append(inp)
+            return 1
+
+        monkeypatch.setattr(win_input, "_call_send_input", fake_send)
+        monkeypatch.setattr(win_input, "virtual_screen_rect", lambda: (0, 0, 1920, 1080))
+        assert win_input.send_mouse_move(100, 200) is True
+
+        inp = captured[0]
+        assert inp.type == win_input.INPUT_MOUSE
+        assert inp.mi.dwFlags & win_input.MOUSEEVENTF_MOVE
+        assert inp.mi.dwFlags & win_input.MOUSEEVENTF_ABSOLUTE
+        assert inp.mi.dwFlags & win_input.MOUSEEVENTF_VIRTUALDESK
+        assert (inp.mi.dx, inp.mi.dy) == win_input.to_absolute_xy(100, 200)
+
+    def test_send_failure_returns_false(self, monkeypatch):
+        monkeypatch.setattr(win_input, "_call_send_input", lambda inp: 0)
+        assert win_input.send_mouse_move(10, 10) is False
+
+    def test_controller_position_goes_through_sendinput(self, monkeypatch):
+        calls = []
+
+        def fake_move(x, y):
+            calls.append((int(x), int(y)))
+            return True
+
+        monkeypatch.setattr(win_input, "send_mouse_move", fake_move)
+        ctl = win_input.make_sendinput_mouse()
+        ctl.position = (321, 654)
+        assert calls == [(321, 654)], "坐标应交给 SendInput，而不是 SetCursorPos"
+
+    def test_player_default_controller_is_sendinput_backed(self):
+        player = MacroPlayer()
+        assert type(player._mouse_ctl()).__name__ == "SendInputMouse"
+
+
+class TestHoverSettle:
+    """移动落点与「按下」之间要留出悬停落定时间。"""
+
+    @staticmethod
+    def _player():
+        player = MacroPlayer()
+        mouse = SpyController()
+        player.set_controllers(mouse_ctl=mouse, keyboard_ctl=SpyController("kbd"))
+        return player, mouse
+
+    def test_press_waits_after_move(self):
+        player, mouse = self._player()
+        start = time.monotonic()
+        player._execute_event(ep.make_move_event(0, 300, 400), 0)
+        player._execute_event(
+            {"t": 0, "type": "mouse_click", "action": "press",
+             "button": "left", "x": 300, "y": 400}, 1)
+        elapsed = time.monotonic() - start
+        assert elapsed >= 0.045, f"移动后立刻按下，只等了 {elapsed*1000:.0f}ms"
+        assert mouse.mouse_actions == [("press", "left")]
+        assert mouse.moves() == [(300, 400)]
+
+    def test_click_only_script_also_settles(self):
+        """只录点击的脚本：_ensure_cursor_at 刚移过去就按下，同样要等。"""
+        player, _ = self._player()
+        start = time.monotonic()
+        player._execute_event(ep.make_click_event(0, "press", "left", 10, 20), 0)
+        assert time.monotonic() - start >= 0.045
+
+    def test_no_delay_when_move_is_old(self):
+        player, _ = self._player()
+        player._dispatch_move(50, 60)
+        time.sleep(0.08)
+        start = time.monotonic()
+        player._execute_event(ep.make_click_event(0, "press", "left", 50, 60), 0)
+        assert time.monotonic() - start < 0.03, "离上次移动很久的点击不应被拖延"
+
+    def test_second_press_of_double_click_not_delayed(self):
+        """双击的第二次按下不能因为落定延时被拉开（会丢双击）。"""
+        player, _ = self._player()
+        player._execute_event(ep.make_move_event(0, 100, 100), 0)
+        player._execute_event(ep.make_click_event(0, "press", "left", 100, 100), 1)
+        start = time.monotonic()
+        player._execute_event(ep.make_click_event(0, "release", "left", 100, 100), 2)
+        player._execute_event(ep.make_click_event(0, "press", "left", 100, 100), 3)
+        assert time.monotonic() - start < 0.03
+
+    def test_reset_clears_settle_marker(self):
+        player, _ = self._player()
+        player._dispatch_move(1, 2)
+        assert player._last_move_ts > 0
+        player.reset_held_state()
+        assert player._last_move_ts == 0.0
+
+    def test_settle_is_interruptible(self):
+        player, _ = self._player()
+        player._dispatch_move(1, 2)
+        player._stop_requested = True
+        start = time.monotonic()
+        player._settle_before_press()
+        assert time.monotonic() - start < 0.02, "收到停止请求时应立即返回"
+
+
+class TestInterpolatedFrameDensity:
+    """模式二补帧：帧间隔要落在 10~15ms，不能几十帧瞬间灌进输入队列。"""
+
+    @staticmethod
+    def _interp_events(frames: int, gap_ms: int = 0) -> list[dict]:
+        events = []
+        for index in range(frames):
+            evt = ep.make_move_event(index * gap_ms, index * 10, index * 10)
+            evt["interp"] = True
+            events.append(evt)
+        return events
+
+    def test_same_timestamp_frames_are_spaced(self):
+        player = MacroPlayer()
+        mouse = SpyController()
+        player.set_controllers(mouse_ctl=mouse, keyboard_ctl=SpyController("kbd"))
+        player.load(self._interp_events(6), "interp")
+
+        start = time.monotonic()
+        player.step_next()
+        elapsed = time.monotonic() - start
+        assert len(mouse.moves()) == 6
+        assert elapsed >= 0.05, f"6 帧只用了 {elapsed*1000:.0f}ms，帧被一起塞进去了"
+
+    def test_frame_gap_matches_constant(self):
+        """补帧间隔常量要落在 10~15ms（60~100fps）。"""
+        assert "_INTERP_FRAME_GAP_MS" in dir(pl)
+        assert 10 <= pl._INTERP_FRAME_GAP_MS <= 15
+
+    def test_dense_recording_keeps_original_pacing(self):
+        """记录本身就只有 8ms 的帧间间隔时，不要人为拉长。"""
+        player = MacroPlayer()
+        mouse = SpyController()
+        player.set_controllers(mouse_ctl=mouse, keyboard_ctl=SpyController("kbd"))
+        player.load(self._interp_events(4, gap_ms=8), "interp")
+        start = time.monotonic()
+        player.step_next()
+        elapsed = time.monotonic() - start
+        assert len(mouse.moves()) == 4
+        assert elapsed < 0.06, f"应保留原始 8ms 节奏，实际 {elapsed*1000:.0f}ms"
