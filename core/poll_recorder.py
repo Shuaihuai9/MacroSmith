@@ -151,6 +151,9 @@ class PollRecorder:
         self._events: list[dict[str, Any]] = []
         self._recording = False
         self._t0 = 0.0
+        #: 时间戳整体偏移（毫秒），与 :class:`core.recorder.Recorder` 保持一致，
+        #: 续录时两通道产出的事件都接在已有脚本后面。
+        self._time_offset_ms = 0
         self.is_paused = False
         self.pause_start_time: Optional[float] = None
         self.total_paused_time = 0.0
@@ -208,7 +211,8 @@ class PollRecorder:
     # ------------------------------------------------------------------
     def start(self, t0: float, stop_vk: int = 0x78,
               pause_vk: int = 0x7A, min_interval_ms: int = 50,
-              min_distance_px: int = 2) -> bool:
+              min_distance_px: int = 2,
+              time_offset_ms: int = 0) -> bool:
         """开始轮询录制。
 
         参数
@@ -220,6 +224,8 @@ class PollRecorder:
             停止录制热键的 VK 码，按下沿触发 ``on_stop_hotkey``。
         pause_vk:
             暂停/继续录制热键的 VK 码，按下沿触发 ``on_pause_hotkey``。
+        time_offset_ms:
+            时间戳整体偏移（毫秒），续录时与 ``Recorder`` 传同一个值。
         """
         if self._user32 is None:  # pragma: no cover
             self._notify_error("轮询录制器不可用：WinAPI 加载失败。")
@@ -235,6 +241,7 @@ class PollRecorder:
             self.pause_start_time = None
             self.total_paused_time = 0.0
             self._t0 = float(t0)
+            self._time_offset_ms = max(0, int(time_offset_ms))
             self.stop_vk = int(stop_vk) & 0xFF
             self.pause_vk = int(pause_vk) & 0xFF
             self.move_min_interval_ms = int(min_interval_ms)
@@ -387,8 +394,9 @@ class PollRecorder:
     # ------------------------------------------------------------------
     def _stamp(self) -> int:
         with self._lock:
-            return max(0, int(
+            elapsed = max(0, int(
                 (time.monotonic() - self._t0 - self.total_paused_time) * 1000))
+            return elapsed + self._time_offset_ms
 
     def _skip(self) -> bool:
         """回放期间为 True：只刷新快照，不产出事件。"""

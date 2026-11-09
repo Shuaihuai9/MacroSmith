@@ -270,6 +270,10 @@ def run_startup_check(app, window, log) -> int:
          "、" .join(sorted(window.recorder.ignored_keys))),
         ("始终记录移动与点击", not hasattr(window, "chk_clicks_only"),
          "「仅录制点击坐标」「记录鼠标移动」开关已删除（第九阶段）"),
+        ("「续录脚本」按钮", (window.btn_append_record.text() == "续录脚本"
+                        and window.btn_append_record.isEnabled()
+                        == bool(window._script_steps)),
+         "有步骤时可用、空脚本禁用；新步骤接在末尾，原有步骤不动"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

@@ -69,6 +69,9 @@ class Recorder:
         self._events: list[dict[str, Any]] = []
         self._recording = False
         self._t0 = 0.0                      # 录制起点（monotonic 秒）
+        #: 时间戳整体偏移（毫秒）。续录时把已有脚本的结束时刻 + 间隔传进来，
+        #: 新事件的时间戳就能直接接在老脚本后面，无需事后平移。
+        self._time_offset_ms = 0
         # 暂停仍会保持录制会话，但丢弃输入，并从后续时间戳扣除暂停时长。
         self.is_paused = False
         self.pause_start_time: Optional[float] = None
@@ -109,6 +112,11 @@ class Recorder:
         """
         return self._t0
 
+    @property
+    def time_offset_ms(self) -> int:
+        """本次录制的时间戳偏移（毫秒）。续录时 > 0，全新录制为 0。"""
+        return self._time_offset_ms
+
     def elapsed_ms(self) -> int:
         """当前有效录制时长（毫秒），不含暂停时间。"""
         with self._lock:
@@ -128,10 +136,15 @@ class Recorder:
     # 开始 / 停止
     # ------------------------------------------------------------------
     def start(self, min_interval_ms: int = 50,
-              min_distance_px: int = 2) -> bool:
+              min_distance_px: int = 2,
+              time_offset_ms: int = 0) -> bool:
         """开始录制。已在录制中则返回 False。
 
         始终记录鼠标移动（带抖动过滤）、点击、滚轮与键盘。
+
+        ``time_offset_ms`` 是时间戳整体偏移，用于**续录**：把它设为
+        「已有脚本的结束时刻 + 间隔」，本次录到的事件就直接接在老脚本后面
+        （第一条事件的 ``t`` 是 offset + 距开录的毫秒数），不需要录完再平移。
         """
         with self._lock:
             if self._recording:
@@ -141,6 +154,7 @@ class Recorder:
             self.is_paused = False
             self.pause_start_time = None
             self.total_paused_time = 0.0
+            self._time_offset_ms = max(0, int(time_offset_ms))
             self.move_min_interval_ms = int(min_interval_ms)
             self.move_min_distance_px = int(min_distance_px)
             # 时间基准：录制开始时取一次 monotonic，之后所有事件都用它做差
@@ -233,10 +247,11 @@ class Recorder:
     # 内部工具
     # ------------------------------------------------------------------
     def _stamp(self) -> int:
-        """生成事件时间戳：相对录制开始，且不含累计暂停时长。"""
+        """生成事件时间戳：相对录制开始（扣除累计暂停时长）+ 续录偏移。"""
         with self._lock:
-            return max(0, int(
+            elapsed = max(0, int(
                 (time.monotonic() - self._t0 - self.total_paused_time) * 1000))
+            return elapsed + self._time_offset_ms
 
     def _skip(self) -> bool:
         """是否忽略当前事件：暂停期间，或程序正在回放自己发出的事件。

@@ -285,6 +285,14 @@ QPushButton#DangerButton:disabled {{
     border-color: {BTN_SECONDARY_PRESS};
 }}
 
+/* —— 录制页顶部动作行：10 个按钮同一行，需要比全局更窄的左右内边距 ——
+   全局 padding 是 6px 14px；本行按 14px 排会超出卡片可用宽度，按钮被压
+   到比理想宽度更窄，文字左右被裁（实测「打开脚本文件」→「开脚本文」）。
+   收到 9px 后 10 个按钮正好排得下，字号与高度都不变。 */
+QWidget#RecordActionBar QPushButton {{
+    padding: 6px 9px;
+}}
+
 /* ===================== 输入控件 ===================== */
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {FIELD_BG};

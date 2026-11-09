@@ -59,6 +59,11 @@ PAGE_LIBRARY = PAGE_SCRIPTS
 #: 按钮内图标尺寸
 _TOOL_ICON_SIZE = QSize(15, 15)
 
+#: 续录时在已有脚本末尾留出的空白间隔（毫秒）。
+#: 不留间隔的话，回放到接缝处会「上一个动作刚结束就立刻蹦出下一个」，
+#: 有些程序会把它当成连续双击；0.5 秒既自然、也能让用户看清接缝。
+_APPEND_GAP_MS = 500
+
 
 class State(Enum):
     """程序运行状态。"""
@@ -133,6 +138,10 @@ class MainWindow(WindowShell):
 
         self._pending_records: list[dict[str, Any]] = []   # 录制事件缓冲
         self._pending_highlights: list[int] = []           # 待高亮行号缓冲
+        # 续录状态：_append_mode 为真时，停止录制只清洗本次新增的事件，
+        # 再把它们接在 _script_events[:_append_base] 后面（原有步骤不动）
+        self._append_mode = False
+        self._append_base = 0
         self._unsaved = False
         self._script_events: list[dict[str, Any]] = []     # 当前载入/录制的事件
         self._script_steps: list[ep.Step] = []             # 当前步骤（编辑后的事实来源）
@@ -294,11 +303,28 @@ class MainWindow(WindowShell):
         # self.mode_combo 引用同一个实例，引用点在 _build_ui。
         top_layout.addLayout(title_row)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
+        # 动作按钮行：本页现在是 10 个按钮挤在一行。默认 1000×700 窗口下
+        # 这一行可用宽度是 876px，而 10 个按钮的理想宽度合计 954px（光左右
+        # 内边距就吃掉 14×2×10=280px），直接塞进卡片会被压得比理想宽度更窄，
+        # 文字被按钮边缘裁掉（实测「打开脚本文件」显示成「开脚本文」、
+        # 「重置指针」丢掉「针」）。这里套一层 #RecordActionBar 容器，把左右
+        # 内边距从全局的 14px 收到 9px、按钮间距从 8px 收到 6px，合计降到
+        # 836px，富余 40px，字号与按钮高度都不变。
+        action_bar = QWidget(page)
+        action_bar.setObjectName("RecordActionBar")
+        button_row = QHBoxLayout(action_bar)
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(6)
         self.btn_start_record = QPushButton("开始录制", page)
         self.btn_start_record.setObjectName("PrimaryButton")
         self.btn_start_record.setIcon(_make_icon(icons.ICON_RECORD, styles.ICON_ON_PRIMARY))
+        self.btn_start_record.setToolTip("全新录制（会覆盖当前步骤列表）")
+        self.btn_append_record = QPushButton("续录脚本", page)
+        self.btn_append_record.setObjectName("SecondaryButton")
+        self.btn_append_record.setIcon(_make_icon(icons.ICON_PLUS, styles.ICON_ON_SECONDARY))
+        self.btn_append_record.setToolTip(
+            "在已有步骤后面接着录：新步骤追加到末尾，原有步骤一条不动。"
+            "列表为空时不可用。")
         self.btn_pause_record = QPushButton("暂停录制", page)
         self.btn_pause_record.setObjectName("SecondaryButton")
         self.btn_pause_record.setToolTip("暂停/继续录制（暂停期间的输入不会记入脚本）")
@@ -314,7 +340,8 @@ class MainWindow(WindowShell):
         self.btn_reset_step.setIcon(_make_icon(icons.ICON_REFRESH, styles.ICON_ON_SECONDARY))
         self.btn_reset_step.setToolTip("模式二：把步骤指针复位到开头")
 
-        for btn in (self.btn_start_record, self.btn_pause_record, self.btn_stop_record,
+        for btn in (self.btn_start_record, self.btn_append_record,
+                    self.btn_pause_record, self.btn_stop_record,
                     self.btn_start_play, self.btn_stop_play, self.btn_reset_step):
             btn.setIconSize(_TOOL_ICON_SIZE)
             btn.setCursor(Qt.PointingHandCursor)
@@ -331,7 +358,7 @@ class MainWindow(WindowShell):
         for btn in (self.btn_load, self.btn_save_as, self.btn_clear):
             btn.setCursor(Qt.PointingHandCursor)
             button_row.addWidget(btn)
-        top_layout.addLayout(button_row)
+        top_layout.addWidget(action_bar)
 
         # 第九阶段起：「仅录制点击坐标」与「记录鼠标移动」两个开关已删除，
         # 录制始终记录鼠标移动（带抖动过滤）+ 点击 + 滚轮 + 键盘。
@@ -493,7 +520,11 @@ class MainWindow(WindowShell):
         self.sidebar.about_clicked.connect(lambda: self._show_page(PAGE_ABOUT))
 
         # 顶部按钮
-        self.btn_start_record.clicked.connect(self.start_recording)
+        # 用 lambda 包一层：clicked 信号带 checked 参数，直接连到带默认参数的
+        # 槽会把 False 当 append 传进去，语义上是错的
+        self.btn_start_record.clicked.connect(lambda: self.start_recording())
+        self.btn_append_record.clicked.connect(
+            lambda: self.start_recording(append=True))
         self.btn_pause_record.clicked.connect(self.toggle_recording_pause)
         self.btn_stop_record.clicked.connect(self.stop_recording)
         self.btn_start_play.clicked.connect(self.start_replay)
@@ -687,19 +718,34 @@ class MainWindow(WindowShell):
     # ==================================================================
     # 录制
     # ==================================================================
-    def start_recording(self) -> None:
-        """开始录制。已有脚本内容时先确认覆盖，避免录到一半才发现丢数据。"""
-        if not self._ensure_mode(MODE_TIMED, "开始录制"):
+    def start_recording(self, append: bool = False) -> None:
+        """开始录制。
+
+        ``append=False``（默认）：全新录制。已有步骤时先确认覆盖。
+        ``append=True``：**续录**——保留现有步骤，把本次录到的事件接在末尾。
+        时间戳会整体偏移到「已有脚本结束时刻 + :data:`_APPEND_GAP_MS`」，
+        所以回放时接缝处有一段自然停顿，不会像两段硬拼在一起。
+        """
+        if not self._ensure_mode(MODE_TIMED, "续录" if append else "开始录制"):
             return
-        # 只有当前确实有录制好的步骤时，才先问清楚再覆盖；空脚本（0 步）
-        # 直接清空开始，不弹窗，避免「新建空脚本后点录制」被无谓打扰。
-        if self._script_steps:
-            if not self._confirm_replace_for_record():
+        offset_ms = 0
+        if append:
+            # 续录必须有内容可接；按钮平时已禁用，这里再兜一层（热键/脚本调用）
+            if not self._script_steps:
+                self._set_message("当前没有步骤可续录，请先录制或载入一个脚本。")
                 return
+            offset_ms = ep.events_duration_ms(self._script_events) + _APPEND_GAP_MS
+        else:
+            # 只有当前确实有录制好的步骤时，才先问清楚再覆盖；空脚本（0 步）
+            # 直接清空开始，不弹窗，避免「新建空脚本后点录制」被无谓打扰。
+            if self._script_steps:
+                if not self._confirm_replace_for_record():
+                    return
         player = self.config.get("player", {}) or {}
         ok = self.recorder.start(
             min_interval_ms=int(player.get("move_min_interval_ms", 50)),
             min_distance_px=int(player.get("move_min_distance_px", 2)),
+            time_offset_ms=offset_ms,
         )
         if not ok:
             self._on_error("录制启动失败：可能是监听器无法启动（权限或安全软件限制）。")
@@ -737,25 +783,39 @@ class MainWindow(WindowShell):
                 pause_vk=pause_vk,
                 min_interval_ms=int(player.get("move_min_interval_ms", 50)),
                 min_distance_px=int(player.get("move_min_distance_px", 2)),
+                time_offset_ms=offset_ms,
         ):
             log.warning("兼容轮询通道启动失败，普通窗口录制不受影响。")
         self._set_state(State.RECORDING)
-        self.event_list.clear()
-        self._script_events = []
-        self._script_steps = []
-        self._current_script = None
-        self.player.clear()
-        self.is_dirty = False
         self._pending_records.clear()
+        self._append_mode = bool(append)
+        if append:
+            # 续录：原样保留已有事件/步骤/脚本路径与回放器内容，
+            # 只记下"原有事件到哪一条为止"，停止时据此切分新旧数据
+            self._append_base = len(self._script_events)
+            note = f"正在续录（接在第 {len(self._script_steps)} 步之后）… "
+        else:
+            self._append_base = 0
+            self.event_list.clear()
+            self._script_events = []
+            self._script_steps = []
+            self._current_script = None
+            self.player.clear()
+            self.is_dirty = False
+            note = "正在录制… "
         self._record_timer.start()
         self._set_message(
-            f"正在录制… 按 "
+            f"{note}按 "
             f"{self.hotkeys.binding_display('record_pause') or 'F11'} 暂停/继续，"
             f"{self.hotkeys.binding_display('record_stop') or 'F9'} 停止录制。"
         )
 
     def stop_recording(self) -> None:
-        """停止录制，保存到内存并刷新界面。"""
+        """停止录制，保存到内存并刷新界面。
+
+        续录时只清洗**本次新增**的那一段，再拼回原有事件前面：
+        旧数据一条都不重写，避免清洗规则变动时把历史步骤改掉。
+        """
         if self.state not in (State.RECORDING, State.RECORD_PAUSED):
             return
         self._record_timer.stop()
@@ -764,18 +824,35 @@ class MainWindow(WindowShell):
         # 两通道事件都经 on_event 管线实时进入 _script_events，此处统一清洗：
         # 补全未释放按键、剔除停止热键、保证时间戳单调（sanitize 幂等）。
         self._flush_ui_buffers()
-        events = ep.sanitize_events(
-            self._script_events, ignore_keys=self.recorder.ignored_keys)
+        append = self._append_mode
+        base = min(self._append_base, len(self._script_events)) if append else 0
+        if append:
+            added = ep.sanitize_events(
+                self._script_events[base:], ignore_keys=self.recorder.ignored_keys)
+            events = list(self._script_events[:base]) + added
+        else:
+            added = ep.sanitize_events(
+                self._script_events, ignore_keys=self.recorder.ignored_keys)
+            events = added
+        self._append_mode = False
+        self._append_base = 0
         if not events:
             # 兜底：清洗后为空时退回原始缓冲，保证界面流程走通
             events = list(self._script_events)
         self._sync_after_recording(events)
         duration = ep.events_duration_ms(events) if events else 0
-        self._set_message(
-            f"录制完成：共 {len(events)} 条事件、"
-            f"{len(self._script_steps)} 个步骤，时长 {duration / 1000:.2f} 秒。"
-            "可在下方勾选编辑，或直接回放。"
-        )
+        if append:
+            self._set_message(
+                f"续录完成：新增 {len(added)} 条事件、{len(self._script_steps)} 个步骤，"
+                f"当前共 {len(events)} 条事件，总时长 {duration / 1000:.2f} 秒。"
+                "可在下方勾选编辑，或直接回放。"
+            )
+        else:
+            self._set_message(
+                f"录制完成：共 {len(events)} 条事件、"
+                f"{len(self._script_steps)} 个步骤，时长 {duration / 1000:.2f} 秒。"
+                "可在下方勾选编辑，或直接回放。"
+            )
 
     def toggle_recording_pause(self) -> None:
         """暂停/继续录制（对应 F11 或界面「暂停录制」按钮）。
@@ -832,7 +909,8 @@ class MainWindow(WindowShell):
         if self.state is State.RECORDING:
             elapsed = self.recorder.elapsed_ms() / 1000.0
             total = self.recorder.event_count + self.poll_recorder.event_count
-            text = f"正在录制… 已录制 {elapsed:.1f} 秒 / {total} 条事件"
+            verb = "续录" if self._append_mode else "录制"
+            text = f"正在{verb}… 本次已录 {elapsed:.1f} 秒 / {total} 条事件"
             if not is_admin():
                 text += "（未以管理员运行：腾讯系界面可能录不到按键，请用管理员身份启动）"
             self.message_label.setText(text)
@@ -2053,6 +2131,17 @@ class MainWindow(WindowShell):
         total = len(self._script_steps)
         index = self.player.step_index
         self.step_label.setText(f"步骤 {index} / {total}")
+
+        # 「续录脚本」的可用性在这里统一刷新：载入脚本、删空步骤、释放脚本
+        # 都只走 _refresh_status，不一定经过 _set_state
+        editing = self.state not in (State.RECORDING, State.RECORD_PAUSED,
+                                     State.REPLAYING, State.PAUSED)
+        append_btn = getattr(self, "btn_append_record", None)
+        if append_btn is not None:
+            append_btn.setEnabled(editing and total > 0)
+            append_btn.setToolTip(
+                "在已有步骤后面接着录：新步骤追加到末尾，原有步骤一条不动。"
+                if total > 0 else "当前没有步骤可续录，请先录制或载入一个脚本。")
 
         # 循环轮数：回放中显示实时轮次，空闲时显示即将使用的循环设置
         round_text = ""

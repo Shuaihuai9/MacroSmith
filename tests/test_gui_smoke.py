@@ -2755,6 +2755,28 @@ class TestUnifiedButtons:
         assert window.btn_clear.objectName() == "DangerButton"
         assert window.btn_new_script.objectName() == "SecondaryButton"
 
+    def test_record_action_bar_not_clipped(self, qapp, window):
+        """录制页动作行的按钮不能被压得比理想宽度更窄（否则文字被裁）。
+
+        回归背景：加上「续录脚本」后这一行变成 10 个按钮。用全局 14px 左右
+        内边距时，默认 1000x700 窗口下理想宽度合计 954px、实际只有 876px，
+        按钮被压窄、文字左右被裁（实测「打开脚本文件」显示成「开脚本文」、
+        「重置指针」少了「针」）。现在 #RecordActionBar 把内边距收到 9px、
+        间距收到 6px，合计 836px，刚好排得下。以后再往这行加按钮时，这条
+        用例会先失败，避免静默裁字。
+        """
+        window.resize(1000, 700)
+        window._show_page(PAGE_RECORD)
+        _pump(qapp, 80)
+        buttons = (window.btn_start_record, window.btn_append_record,
+                   window.btn_pause_record, window.btn_stop_record,
+                   window.btn_start_play, window.btn_stop_play,
+                   window.btn_reset_step, window.btn_load,
+                   window.btn_save_as, window.btn_clear)
+        squeezed = [(b.text(), b.width(), b.sizeHint().width())
+                    for b in buttons if b.width() < b.sizeHint().width()]
+        assert squeezed == [], f"这些按钮被压窄，文字会被按钮边缘裁掉：{squeezed}"
+
 
 class TestScriptsPageStructure:
     """「回放与脚本」成为默认页，并整合回放控制。"""
@@ -3241,3 +3263,176 @@ class _NullKeyboard:
 
     def release_all(self) -> None:
         pass
+
+
+# ===========================================================================
+# 续录（在已有脚本末尾追加）
+# ===========================================================================
+class TestAppendRecording:
+    """续录：新事件接在老脚本后面，原有步骤一条不动。"""
+
+    @staticmethod
+    def _five_second_script() -> list[dict]:
+        """一段 5.0 秒结束的脚本：移动 + 点击 + 末尾移动。"""
+        return [
+            ep.make_move_event(0, 100, 100),
+            ep.make_click_event(1000, "press", "left", 100, 100),
+            ep.make_click_event(1040, "release", "left", 100, 100),
+            ep.make_move_event(5000, 200, 200),
+        ]
+
+    @staticmethod
+    def _start_append(window, monkeypatch, offset_box: dict) -> None:
+        """启动续录，并记录传给录制器的偏移量（不启动真实监听）。"""
+        def fake_start(**kwargs):
+            offset_box.update(kwargs)
+            return True
+
+        monkeypatch.setattr(window.recorder, "start", fake_start)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        monkeypatch.setattr(window.poll_recorder, "start", lambda **k: False)
+        monkeypatch.setattr(window.poll_recorder, "stop", lambda: [])
+        window.start_recording(append=True)
+
+    def test_button_disabled_when_script_empty(self, window):
+        assert window.btn_append_record.isEnabled() is False
+        assert window.btn_append_record.text() == "续录脚本"
+
+    def test_button_enabled_after_loading_script(self, window, qapp):
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        assert window.btn_append_record.isEnabled() is True
+
+    def test_button_disabled_while_recording(self, window, qapp, monkeypatch):
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+        assert window.btn_append_record.isEnabled() is False
+        assert window.btn_start_record.isEnabled() is False
+        window.stop_recording()
+        _pump(qapp, 60)
+
+    def test_append_without_steps_is_rejected(self, window, qapp):
+        """空脚本调用续录：不进入录制态，给出提示。"""
+        window.start_recording(append=True)
+        assert window.state is State.IDLE
+        assert "没有步骤可续录" in window.message_label.text()
+
+    def test_offset_is_last_end_plus_gap(self, window, qapp, monkeypatch):
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+        assert window.state is State.RECORDING
+        # 5.0s 结束 + 0.5s 间隔 = 5500ms
+        assert offset_box["time_offset_ms"] == ep.events_duration_ms(
+            self._five_second_script()) + 500 == 5500
+        window.stop_recording()
+        _pump(qapp, 60)
+
+    def test_append_result_keeps_old_steps_and_extends_time(self, window, qapp,
+                                                            monkeypatch):
+        """核心断言：新增步骤接在末尾，总时长与最后一步结束时间正确。"""
+        original = self._five_second_script()
+        _load_into_window(window, original)
+        _pump(qapp, 40)
+        window._current_script = Path("已有脚本.json")
+        old_steps = len(window._script_steps)
+
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+        offset = offset_box["time_offset_ms"]
+
+        # 续录开始 1 秒后点了一下（按用户给的例子：5.0 + 0.5 + 1.0 = 6.5s）
+        new_events = [
+            ep.make_move_event(offset + 1000, 300, 300),
+            ep.make_click_event(offset + 1100, "press", "left", 300, 300),
+            ep.make_click_event(offset + 1140, "release", "left", 300, 300),
+        ]
+        assert new_events[0]["t"] == 6500
+        for evt in new_events:
+            window._on_recorder_event(evt)
+
+        window.stop_recording()
+        _pump(qapp, 80)
+
+        assert window.state is State.IDLE
+        # 原有 3 步 + 新增 1 个点击步；新增的移动事件与末尾那个移动步是
+        # 连续 move，按既有合并规则并进同一步（轨迹步），所以只多 1 步
+        assert len(window._script_steps) == old_steps + 1
+        # 新增的点击确实独立成步，且落在末尾
+        assert window._script_steps[-1].kind == "click"
+        assert "300, 300" in window._script_steps[-1].description
+        # 老事件一条都没被改
+        for index, evt in enumerate(original):
+            assert window._script_events[index] == evt
+        # 新事件接在末尾，时间戳连续
+        assert len(window._script_events) == len(original) + 3
+        assert window._script_events[-1]["t"] == 6640
+        assert ep.events_duration_ms(window._script_events) == 6640
+        # 最后一步的结束时间 = 新录的释放事件
+        assert window._script_steps[-1].events[-1]["t"] == 6640
+        # 未保存标记 + 脚本路径保留（保存时覆盖原脚本）
+        assert window.is_dirty is True
+        assert window._current_script == Path("已有脚本.json")
+        assert "续录完成" in window.message_label.text()
+
+    def test_append_reports_new_event_count(self, window, qapp, monkeypatch):
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+        for evt in (ep.make_move_event(offset_box["time_offset_ms"] + 100, 5, 5),
+                    ep.make_move_event(offset_box["time_offset_ms"] + 200, 6, 6)):
+            window._on_recorder_event(evt)
+        window.stop_recording()
+        _pump(qapp, 80)
+        assert "新增 2 条事件" in window.message_label.text()
+
+    def test_append_supports_pause_and_stop(self, window, qapp, monkeypatch):
+        """续录同样支持 F11 暂停 / F9 停止。"""
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+
+        window._on_hotkey_action("record_pause")
+        assert window.state is State.RECORD_PAUSED
+        window._on_hotkey_action("record_pause")
+        assert window.state is State.RECORDING
+        window._on_hotkey_action("record_stop")
+        _pump(qapp, 80)
+        assert window.state is State.IDLE
+
+    def test_append_mid_recording_does_not_clear_list(self, window, qapp, monkeypatch):
+        """续录期间列表里应同时看到旧步骤，而不是被清空重录。"""
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        old_steps = len(window._script_steps)
+        offset_box: dict = {}
+        self._start_append(window, monkeypatch, offset_box)
+        assert len(window._script_steps) == old_steps
+        assert len(window.event_list.checked_indices()) == 0
+        window.stop_recording()
+        _pump(qapp, 60)
+
+    def test_fresh_recording_still_clears(self, window, qapp, monkeypatch):
+        """回归：全新录制仍然会清空旧步骤（续录不得改变原有语义）。"""
+        _load_into_window(window, self._five_second_script())
+        _pump(qapp, 40)
+        monkeypatch.setattr(window.recorder, "start", lambda **kwargs: True)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        monkeypatch.setattr(window.poll_recorder, "start", lambda **k: False)
+        monkeypatch.setattr(window.poll_recorder, "stop", lambda: [])
+        # 覆盖确认弹窗是真实 QMessageBox 实例（clickedButton 判定），
+        # 离屏环境点不了按钮，这里直接放过确认步骤
+        monkeypatch.setattr(window, "_confirm_replace_for_record",
+                            lambda: True)
+
+        window.start_recording()          # 全新录制
+        assert window.state is State.RECORDING
+        assert window._script_steps == []
+        assert window._script_events == []
+        window.stop_recording()
+        _pump(qapp, 60)

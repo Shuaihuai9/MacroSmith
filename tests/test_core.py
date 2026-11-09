@@ -3011,3 +3011,74 @@ class TestInterpolatedFrameDensity:
         elapsed = time.monotonic() - start
         assert len(mouse.moves()) == 4
         assert elapsed < 0.06, f"应保留原始 8ms 节奏，实际 {elapsed*1000:.0f}ms"
+
+
+# ---------------------------------------------------------------------------
+# 续录：录制器的时间戳偏移
+# ---------------------------------------------------------------------------
+class TestRecordTimeOffset:
+    """续录靠「录制器给时间戳加偏移」实现，事件天生接在老脚本后面。"""
+
+    @staticmethod
+    def _started(offset_ms: int) -> Recorder:
+        rec = Recorder(is_executing=lambda: False)
+        rec.start(time_offset_ms=offset_ms)
+        rec._recording = True          # 不依赖真实钩子
+        rec._t0 = time.monotonic()
+        return rec
+
+    def test_stamp_starts_at_offset(self):
+        rec = self._started(5500)
+        try:
+            assert rec.time_offset_ms == 5500
+            assert 5500 <= rec._stamp() < 6000, rec._stamp()
+        finally:
+            rec.stop()
+
+    def test_fresh_recording_has_no_offset(self):
+        rec = self._started(0)
+        try:
+            assert rec.time_offset_ms == 0
+            assert rec._stamp() < 200
+        finally:
+            rec.stop()
+
+    def test_negative_offset_clamped_to_zero(self):
+        rec = self._started(-1000)
+        try:
+            assert rec.time_offset_ms == 0
+        finally:
+            rec.stop()
+
+    def test_offset_survives_pause_resume(self):
+        """暂停时长要从时间戳里扣掉，但偏移量必须保留。"""
+        rec = self._started(2000)
+        try:
+            rec.pause()
+            time.sleep(0.06)
+            rec.resume()
+            stamp = rec._stamp()
+            assert stamp >= 2000, stamp
+            # 暂停的 60ms 不应被计入时间戳
+            assert stamp < 2100, stamp
+        finally:
+            rec.stop()
+
+    def test_offset_applies_to_recorded_events(self):
+        """真实追加一条事件：t 必须落在偏移之后。"""
+        rec = self._started(3000)
+        try:
+            rec._append(ep.make_move_event(rec._stamp(), 7, 8))
+            events = rec.get_events()
+            assert len(events) == 1
+            assert events[0]["t"] >= 3000
+        finally:
+            rec.stop()
+
+    def test_poll_recorder_accepts_offset(self):
+        rec = PollRecorder()
+        assert rec.start(t0=time.monotonic(), time_offset_ms=4500) is True
+        try:
+            assert rec._stamp() >= 4500
+        finally:
+            rec.stop()
