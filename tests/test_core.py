@@ -18,7 +18,7 @@ import pytest
 from core import event_parser as ep
 from core import player as pl
 from core import win_input
-from core.config import Config
+from core.config import DEFAULT_HOTKEYS, HOTKEY_LABELS, Config
 from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
                               WM_KEYDOWN, WM_KEYUP, KeyboardHook, hook_supported)
 from core.hotkey_manager import HotkeyManager, display_name, normalize_token, parse_key
@@ -1616,6 +1616,43 @@ class TestKeyToVk:
 
         assert key_to_vk("这不是键") is None
         assert key_to_vk("") is None
+
+
+class TestRecordStartHotkey:
+    """开始录制热键（默认 F12）：默认绑定与旧配置兼容。"""
+
+    def test_default_binding_is_f12(self):
+        assert DEFAULT_HOTKEYS["record_start"] == "f12"
+        label, describe = HOTKEY_LABELS["record_start"]
+        assert label == "开始录制"
+        assert "开始录制" in describe
+        assert parse_key("f12") is not None
+
+    def test_start_key_is_not_a_stop_or_pause_duplicate(self):
+        """三个录制控制键不能撞车，否则按一下会触发两个动作。"""
+        trio = [DEFAULT_HOTKEYS[k] for k in
+                ("record_start", "record_stop", "record_pause")]
+        assert len(set(trio)) == 3
+
+    def test_old_config_without_record_start_gets_default(self, tmp_path: Path):
+        """升级前的配置文件里没有 record_start，加载后必须自动补上 F12。"""
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(
+            {"hotkeys": {"record_stop": "f10", "play_toggle": "f6"}},
+            ensure_ascii=False), encoding="utf-8")
+        cfg = Config(path)
+        assert cfg.hotkey("record_start") == "f12"
+        assert cfg.hotkey("record_stop") == "f10"      # 用户改过的键原样保留
+
+    def test_poll_recorder_accepts_start_vk(self):
+        """兼容通道要能接收开始键的 VK，录制中把它跳过而不是录成一步。"""
+        rec = PollRecorder()
+        assert rec.start_vk == 0x7B                     # 默认 F12
+        assert rec.start(t0=time.monotonic(), start_vk=0x74) is True
+        try:
+            assert rec.start_vk == 0x74
+        finally:
+            rec.stop()
 
 
 class TestHotkeyExclusiveMode:

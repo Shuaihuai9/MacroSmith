@@ -213,6 +213,11 @@ def run_startup_check(app, window, log) -> int:
     combo = window.script_name_edit
     combo_scripts = sum(1 for i in range(combo.count()) if combo.itemData(i))
     page = window.page_library
+    # 任务栏状态徽标：四种徽标都要画得出来（画不出来会被 _apply_state_icon 静默吞掉）
+    from ui.state_icon import BADGES, state_icon
+    badge_icons = {k: state_icon(icon, k) for k in BADGES} if icon is not None else {}
+    badge_ok = (len(badge_icons) == 4
+                and all(i is not None and not i.isNull() for i in badge_icons.values()))
     checks = [
         ("窗口标题", window.windowTitle().startswith("宏匠"), window.windowTitle()),
         ("原生窗口边框", (not (window.windowFlags() & Qt.FramelessWindowHint))
@@ -264,7 +269,7 @@ def run_startup_check(app, window, log) -> int:
         ("热键独占模式", window.hotkeys.exclusive,
          "已开启（命中热键不再传给前台程序）" if window.hotkeys.exclusive
          else "已关闭（按键会同时触发前台程序）"),
-        ("热键绑定完整", len(hotkeys) == 8, "、".join(f"{k}={v}" for k, v in hotkeys.items())),
+        ("热键绑定完整", len(hotkeys) == 9, "、".join(f"{k}={v}" for k, v in hotkeys.items())),
         ("停止录制键不入脚本", "f9" in window.recorder.ignored_keys
          and "f11" in window.recorder.ignored_keys,
          "、" .join(sorted(window.recorder.ignored_keys))),
@@ -280,6 +285,8 @@ def run_startup_check(app, window, log) -> int:
                     and window.event_list.table.selectionMode()
                     == QAbstractItemView.ExtendedSelection),
          "类型下拉 6 种 + 「全选此类型」；表格整行扩展选择，可按住左键框选"),
+        ("任务栏状态徽标", badge_ok and window._base_icon is not None,
+         "录制红点 / 暂停琥珀双竖条 / 回放绿三角，空闲不叠徽标；只换图标不改标题"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

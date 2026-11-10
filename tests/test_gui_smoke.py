@@ -996,10 +996,11 @@ class TestScriptLibrary:
 # ===========================================================================
 class TestHotkeys:
     def test_default_bindings_displayed(self, window):
+        assert window.hotkeys.binding_display("record_start") == "F12"
         assert window.hotkeys.binding_display("record_stop") == "F9"
         assert window.hotkeys.binding_display("step_next") == "PageDown"
-        # 模式一下的状态栏提示应包含“停止录制 F9”与“开始回放 F6”
-        assert "F9" in window.hotkey_label.text()
+        # 空闲态的状态栏提示应包含「F12 开始录制」与「F6 开始回放」
+        assert "F12" in window.hotkey_label.text()
         assert "F6" in window.hotkey_label.text()
 
     def test_step_mode_hints(self, window, qapp):
@@ -1028,7 +1029,13 @@ class TestHotkeys:
         assert loaded.hotkey("record_stop") == "f10"
         window._show_page(PAGE_RECORD)
         window._refresh_status()
+        # 空闲态只列「现在按了有效」的键，停止录制显示在录制态里，
+        # 所以这里切到录制态验证改键确实反映到提示上。
+        window._set_state(State.RECORDING)
+        window._refresh_hotkey_hint()
         assert "F10" in window.hotkey_label.text()
+        window._set_state(State.IDLE)
+        window._refresh_status()
 
     def test_duplicate_hotkeys_rejected(self, window, qapp, monkeypatch):
         calls = []
@@ -3613,3 +3620,265 @@ class TestBatchSelection:
         QTest.keyClick(table, Qt.Key_Space)
         _pump(qapp, 30)
         assert editor.checked_indices() == [row]
+
+
+# ===========================================================================
+# 开始录制热键（默认 F12）
+# ===========================================================================
+class TestRecordStartHotkeyGUI:
+    """F12 = 开始录制：空闲生效、录制/回放中静默挡掉、本身不进脚本。"""
+
+    def _stub_recorder(self, window, monkeypatch) -> list:
+        """打桩录制器，返回「start 被调用了几次」的计数列表。
+
+        不能靠状态栏文字判断有没有重复启动——录制中的 120ms 刷新定时器会
+        不停改写那条消息，断言文字必然是脆的。
+        """
+        calls: list[dict] = []
+
+        def fake_start(**kwargs):
+            calls.append(kwargs)
+            return True
+
+        monkeypatch.setattr(window.recorder, "start", fake_start)
+        monkeypatch.setattr(window.recorder, "stop", lambda: [])
+        monkeypatch.setattr(window.poll_recorder, "start", lambda **kwargs: False)
+        monkeypatch.setattr(window.poll_recorder, "stop", lambda: [])
+        return calls
+
+    def test_hotkey_starts_recording(self, window, qapp, monkeypatch):
+        calls = self._stub_recorder(window, monkeypatch)
+        assert window.state is State.IDLE
+        window._on_hotkey_action("record_start")
+        assert window.state is State.RECORDING
+        assert len(calls) == 1
+        # 开始录制的提示只在按下瞬间有效（随后会被 120ms 刷新覆盖）
+        assert "正在录制" in window.message_label.text()
+        window.stop_recording()
+        _pump(qapp, 60)
+        assert window.state is State.IDLE
+
+    def test_hotkey_ignored_while_recording(self, window, qapp, monkeypatch):
+        """录制中再按 F12 不能重开一段（那会清掉刚录的内容）。"""
+        calls = self._stub_recorder(window, monkeypatch)
+        window._on_hotkey_action("record_start")
+        for event in _sample_events():
+            window.sig_recorded.emit(event)
+        _pump(qapp, 200)
+        before = len(window._script_events)
+
+        window._on_hotkey_action("record_start")
+        _pump(qapp, 20)
+        assert window.state is State.RECORDING
+        assert len(calls) == 1, "录制中再按 F12 不许重开一段（会清掉刚录的内容）"
+        assert len(window._script_events) >= before
+
+        window.stop_recording()
+        _pump(qapp, 60)
+
+    def test_hotkey_ignored_while_replaying(self, window, qapp, monkeypatch):
+        """回放途中按 F12 不抢状态机。"""
+        calls = self._stub_recorder(window, monkeypatch)
+        _load_into_window(window, _sample_events())
+        _install_null_controllers(window)
+        window.start_replay()
+        _pump(qapp, 40)
+        assert window.state in (State.REPLAYING, State.PAUSED)
+
+        window._on_hotkey_action("record_start")
+        _pump(qapp, 20)
+        assert window.state in (State.REPLAYING, State.PAUSED)
+        assert calls == [], "回放中按 F12 绝不能启动录制"
+        window.stop_replay()
+        _pump(qapp, 60)
+
+    def test_start_key_never_recorded(self, window, qapp, monkeypatch):
+        """F12 必须进「永不录制」名单（token 与 vk 两种写法都要有）。"""
+        self._stub_recorder(window, monkeypatch)
+        window._on_hotkey_action("record_start")
+        ignored = window.recorder.ignored_keys
+        assert "f12" in ignored
+        assert "vk:123" in ignored
+        window.stop_recording()
+        _pump(qapp, 60)
+
+    def test_start_key_follows_rebinding(self, window, qapp, monkeypatch):
+        """用户把开始键改成 F5 后，忽略名单要跟着变，别把 F5 录进脚本。"""
+        self._stub_recorder(window, monkeypatch)
+        window.config.set("hotkeys.record_start", "f5")
+        window._on_hotkey_action("record_start")
+        ignored = window.recorder.ignored_keys
+        assert "f5" in ignored
+        assert "vk:116" in ignored
+        assert "f12" not in ignored
+        window.stop_recording()
+        _pump(qapp, 60)
+
+
+# ===========================================================================
+# 任务栏状态徽标（ui/state_icon.py）
+# ===========================================================================
+class TestStateIcon:
+    """窗口图标按状态叠角标：录制红点 / 暂停琥珀双竖条 / 回放绿三角。
+
+    为什么要按颜色断言而不是「图标对象变了」了事：徽标是画在像素上的，
+    绘制代码一旦抛异常就会被 ``_apply_state_icon`` 的 try/except 吞掉，
+    窗口图标静默停留在上一张——看起来"什么都没变"，肉眼很难发现。
+    这里直接数像素，能把这个坑钉死（历史上 ``drawPolygon`` 就踩过一次）。
+    """
+
+    #: 期望的徽标底色（写死字面量，不引用常量，才测得出"配色被改错"）
+    REC_COLOR = "#e5484d"        # 录制红
+    PAUSE_COLOR = "#f0a22e"      # 录制暂停：琥珀
+    PLAY_COLOR = "#2fa36b"       # 回放中：绿（刻意不用强调蓝，图标本身是蓝底）
+    PLAY_PAUSE_COLOR = "#1f7a57"  # 回放暂停：暗绿（保留"回放"语义，压暗表示停着）
+
+    @staticmethod
+    def _image(window, size: int = 48):
+        """取窗口当前图标在指定尺寸下的位图。"""
+        return window.windowIcon().pixmap(size, size).toImage()
+
+    @staticmethod
+    def _count(image, color: str, tol: int = 8) -> int:
+        """统计接近目标颜色的像素个数。"""
+        from PySide6.QtGui import QColor
+
+        target = QColor(color)
+        hits = 0
+        for y in range(image.height()):
+            for x in range(image.width()):
+                c = image.pixelColor(x, y)
+                if (abs(c.red() - target.red()) <= tol
+                        and abs(c.green() - target.green()) <= tol
+                        and abs(c.blue() - target.blue()) <= tol):
+                    hits += 1
+        return hits
+
+    # -- 纯函数层 ---------------------------------------------------------
+    def test_replaying_badge_actually_painted(self, qapp):
+        """回归：回放徽标必须真的画出来（曾因 drawPolygon 抛 TypeError 而静默失效）。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        base = load_app_icon()
+        assert base is not None and not base.isNull()
+
+        icon = state_icon(base, "replaying")
+        assert icon is not None
+        image = icon.pixmap(48, 48).toImage()
+        assert self._count(image, self.PLAY_COLOR) >= 40, "回放徽标没画出来"
+
+    @pytest.mark.parametrize("state,color", [
+        ("recording", REC_COLOR),
+        ("record_paused", PAUSE_COLOR),
+        ("replaying", PLAY_COLOR),
+        ("paused", PLAY_PAUSE_COLOR),
+    ])
+    def test_each_badge_uses_its_own_color(self, qapp, state, color):
+        """四种徽标各自的底色必须真的出现在图标上。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        image = state_icon(load_app_icon(), state).pixmap(48, 48).toImage()
+        assert self._count(image, color) >= 40
+
+        # 其余三种颜色都不该出现，避免"画错色"蒙混过关
+        others = {self.REC_COLOR, self.PAUSE_COLOR,
+                  self.PLAY_COLOR, self.PLAY_PAUSE_COLOR} - {color}
+        for other in others:
+            assert self._count(image, other) == 0, f"{state} 上混进了 {other}"
+
+    def test_idle_and_unknown_state_keep_base_icon(self, qapp):
+        """空闲 / 未知状态不叠任何徽标，原图标原样返回。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        base = load_app_icon()
+        assert state_icon(base, "") is base
+        assert state_icon(base, "idle") is base
+
+    def test_none_base_is_tolerated(self, qapp):
+        """没有基图标时返回 None，不抛异常（图标文件缺失也不该崩）。"""
+        from ui.state_icon import state_icon
+
+        assert state_icon(None, "recording") is None
+
+    def test_cache_reuses_same_icon(self, qapp):
+        """同一状态重复取图标应命中缓存（否则每次状态切换都重画 7 张位图）。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        base = load_app_icon()
+        assert state_icon(base, "recording") is state_icon(base, "recording")
+
+    def test_two_pause_states_are_distinguishable(self, qapp):
+        """录制暂停与回放暂停必须长得不一样——最小化后要能分清停的是什么。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        base = load_app_icon()
+        rec_pause = state_icon(base, "record_paused").pixmap(48, 48).toImage()
+        play_pause = state_icon(base, "paused").pixmap(48, 48).toImage()
+        replay = state_icon(base, "replaying").pixmap(48, 48).toImage()
+
+        assert rec_pause != play_pause, "两种暂停共用一套配色，用户分不清"
+        assert replay != play_pause
+
+    def test_all_sizes_are_available(self, qapp):
+        """16/24/32/48 都要有位图，任务栏大小图标才不会糊。"""
+        from utils.win_utils import load_app_icon
+        from ui.state_icon import state_icon
+
+        icon = state_icon(load_app_icon(), "recording")
+        for size in (16, 24, 32, 48):
+            assert not icon.pixmap(size, size).isNull()
+        # 16px 上也得真的画得下（像素太小也别丢整块徽标）
+        small = icon.pixmap(16, 16).toImage()
+        assert self._count(small, self.REC_COLOR, tol=28) >= 8
+
+    # -- 窗口接线层 -------------------------------------------------------
+    @pytest.mark.parametrize("state,color", [
+        (State.RECORDING, REC_COLOR),
+        (State.RECORD_PAUSED, PAUSE_COLOR),
+        (State.REPLAYING, PLAY_COLOR),
+        (State.PAUSED, PLAY_PAUSE_COLOR),
+    ])
+    def test_set_state_swaps_taskbar_icon(self, window, qapp, state, color):
+        """切换状态时窗口图标要跟着换（任务栏按钮与 Alt+Tab 都会变）。"""
+        from ui.state_icon import clear_cache
+
+        clear_cache()
+        window._set_state(State.IDLE)
+        _pump(qapp, 20)
+        assert self._count(self._image(window), color) == 0
+
+        window._set_state(state)
+        _pump(qapp, 20)
+        assert self._count(self._image(window), color) >= 40, f"{state} 没换上徽标"
+
+    def test_state_change_never_touches_title(self, window, qapp):
+        """徽标只换图标，窗口标题必须始终是「宏匠」。"""
+        for state in (State.IDLE, State.RECORDING, State.RECORD_PAUSED,
+                      State.REPLAYING, State.PAUSED):
+            window._set_state(state)
+            _pump(qapp, 10)
+            assert window.windowTitle() == WINDOW_TITLE
+        window._set_state(State.IDLE)
+
+    def test_back_to_idle_restores_plain_icon(self, window, qapp):
+        """回到空闲要把徽标去掉，不能留着上一状态的残影。"""
+        window._set_state(State.RECORDING)
+        _pump(qapp, 10)
+        assert self._count(self._image(window), self.REC_COLOR) >= 40
+
+        window._set_state(State.IDLE)
+        _pump(qapp, 10)
+        assert self._count(self._image(window), self.REC_COLOR) == 0
+
+    def test_missing_base_icon_is_harmless(self, window, qapp):
+        """拿不到基图标时状态切换照常进行（不抛异常、不影响状态机）。"""
+        window._base_icon = None
+        window._set_state(State.REPLAYING)
+        _pump(qapp, 10)
+        assert window.state is State.REPLAYING
+        window._set_state(State.IDLE)

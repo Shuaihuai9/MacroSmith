@@ -167,6 +167,10 @@ class PollRecorder:
         self.stop_vk: int = 0x78
         #: 暂停/继续录制热键的 VK（默认 F11 = 0x7A）。
         self.pause_vk: int = 0x7A
+        #: 开始录制热键的 VK（默认 F12 = 0x7B）。轮询通道不需要它「触发」什么
+        #: （开始录制一定发生在前台程序不是腾讯系平台的时候），只负责在录制
+        #: 过程中把误按的这一下**跳过**，别让它变成脚本里的一个按键步骤。
+        self.start_vk: int = 0x7B
 
         # 上一轮输入状态快照（vk -> 是否按下），沿检测的基准
         self._prev_mouse: dict[int, bool] = {}
@@ -210,7 +214,8 @@ class PollRecorder:
     # 开始 / 停止
     # ------------------------------------------------------------------
     def start(self, t0: float, stop_vk: int = 0x78,
-              pause_vk: int = 0x7A, min_interval_ms: int = 50,
+              pause_vk: int = 0x7A, start_vk: int = 0x7B,
+              min_interval_ms: int = 50,
               min_distance_px: int = 2,
               time_offset_ms: int = 0) -> bool:
         """开始轮询录制。
@@ -224,6 +229,9 @@ class PollRecorder:
             停止录制热键的 VK 码，按下沿触发 ``on_stop_hotkey``。
         pause_vk:
             暂停/继续录制热键的 VK 码，按下沿触发 ``on_pause_hotkey``。
+        start_vk:
+            开始录制热键的 VK 码。本通道不触发它，只把这一下跳过（不录进脚本），
+            与钩子通道的 ``ignored_keys`` 保持一致。
         time_offset_ms:
             时间戳整体偏移（毫秒），续录时与 ``Recorder`` 传同一个值。
         """
@@ -244,6 +252,7 @@ class PollRecorder:
             self._time_offset_ms = max(0, int(time_offset_ms))
             self.stop_vk = int(stop_vk) & 0xFF
             self.pause_vk = int(pause_vk) & 0xFF
+            self.start_vk = int(start_vk) & 0xFF
             self.move_min_interval_ms = int(min_interval_ms)
             self.move_min_distance_px = int(min_distance_px)
             self._recording = True
@@ -350,6 +359,9 @@ class PollRecorder:
                     was = self._prev_keys.get(vk, False)
                     if now and not was:
                         self._fire_pause_hotkey()
+                    continue
+                if vk == self.start_vk:
+                    # 开始录制键：录制中误按不会触发任何动作，也不进脚本
                     continue
                 if self.is_paused:
                     continue

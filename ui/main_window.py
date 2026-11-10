@@ -127,11 +127,14 @@ class MainWindow(WindowShell):
         # 样式表同时挂到窗口上，保证子控件无论从哪一层都能取到样式
         self.setStyleSheet(styles.build_stylesheet())
         # 无边框窗口需要显式设置窗口图标（任务栏与 Alt+Tab 都用它）
+        # 另存一份原图标：_apply_state_icon() 要在它上面叠「录制中/回放中」徽标
+        self._base_icon = None
         try:
             from utils.win_utils import load_app_icon
 
             icon = load_app_icon()
             if icon is not None and not icon.isNull():
+                self._base_icon = icon
                 self.setWindowIcon(icon)
         except Exception:  # pragma: no cover - 图标缺失不应影响启动
             log.debug("设置窗口图标失败", exc_info=True)
@@ -574,6 +577,7 @@ class MainWindow(WindowShell):
     def _register_hotkeys(self) -> None:
         """按配置重新注册全部全局热键，失败时提示用户改键。"""
         callbacks = {
+            "record_start": lambda: self.sig_hotkey.emit("record_start"),
             "record_stop": lambda: self.sig_hotkey.emit("record_stop"),
             "record_pause": lambda: self.sig_hotkey.emit("record_pause"),
             "play_toggle": lambda: self.sig_hotkey.emit("play_toggle"),
@@ -651,6 +655,9 @@ class MainWindow(WindowShell):
 
         第九阶段策略：**任何模式下所有热键都生效，并自动切到对应模式**。
 
+        * F12 开始录制：仅空闲（编辑态）时生效，等同点「开始录制」；
+          录制中再按不重开一段，回放中按不抢状态机（见
+          :meth:`_start_recording_by_hotkey`）。
         * F6 开始回放：空闲时无论当前是模式一还是模式二，一律切到
           **模式一**并开始原速回放；已在回放/暂停中则是暂停/继续切换。
         * F7 暂停/继续：回放/暂停中切换暂停；**模式二空闲**时视为
@@ -661,6 +668,9 @@ class MainWindow(WindowShell):
           （切换由 _enter_step_mode 完成；若模式一正在回放，会先停止
           当前回放再单步，两个执行通道互斥，见 _enter_step_mode）。
         """
+        if action == "record_start":
+            self._start_recording_by_hotkey()
+            return
         if action == "record_stop":
             if self.state in (State.RECORDING, State.RECORD_PAUSED):
                 self.stop_recording()
@@ -720,6 +730,21 @@ class MainWindow(WindowShell):
     # ==================================================================
     # 录制
     # ==================================================================
+    def _start_recording_by_hotkey(self) -> None:
+        """开始录制热键（默认 F12）：等同点「开始录制」，但带状态守卫。
+
+        按钮在录制/回放中本来就是禁用的，热键是全局的、随时可能被误按，
+        所以这里把两种情况都挡掉并给一句话，而不是让 ``start_recording``
+        在回放中途把数据改掉。
+        """
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
+            self._set_message("已经在录制中了，按停止录制键结束这一段。")
+            return
+        if self.state in (State.REPLAYING, State.PAUSED):
+            self._set_message("正在回放中，先停止回放再开始录制。")
+            return
+        self.start_recording()
+
     def start_recording(self, append: bool = False) -> None:
         """开始录制。
 
@@ -756,6 +781,7 @@ class MainWindow(WindowShell):
         # 启动失败不影响普通录制，仅记录日志。
         stop_vk = 0x78   # 默认 F9
         pause_vk = 0x7A  # 默认 F11
+        start_vk = 0x7B  # 默认 F12
         hotkeys = self.config.get("hotkeys", {}) or {}
         try:
             vk = key_to_vk(hotkeys.get("record_stop", "f9"))
@@ -769,10 +795,16 @@ class MainWindow(WindowShell):
                 pause_vk = vk
         except Exception:
             log.debug("解析暂停热键 VK 失败，兼容通道使用默认 F11", exc_info=True)
-        # 录制期间，把停止/暂停控制键的 token 与 vk 两种写法都加入忽略名单，
-        # 保证用户改键后同样不会把控制键录进脚本。
+        try:
+            vk = key_to_vk(hotkeys.get("record_start", "f12"))
+            if isinstance(vk, int):
+                start_vk = vk
+        except Exception:
+            log.debug("解析开始录制热键 VK 失败，兼容通道使用默认 F12", exc_info=True)
+        # 录制期间，把开始/停止/暂停控制键的 token 与 vk 两种写法都加入忽略名单，
+        # 保证用户改键后同样不会把控制键录进脚本（录制中误按 F12 不该变成一步按键）。
         self.recorder.ignored_keys = set(DEFAULT_IGNORED_KEYS)
-        for action in ("record_stop", "record_pause"):
+        for action in ("record_start", "record_stop", "record_pause"):
             token = str(hotkeys.get(action, "")).strip().lower()
             if token:
                 self.recorder.ignored_keys.add(token)
@@ -783,6 +815,7 @@ class MainWindow(WindowShell):
                 t0=self.recorder.t0,
                 stop_vk=stop_vk,
                 pause_vk=pause_vk,
+                start_vk=start_vk,
                 min_interval_ms=int(player.get("move_min_interval_ms", 50)),
                 min_distance_px=int(player.get("move_min_distance_px", 2)),
                 time_offset_ms=offset_ms,
@@ -2078,8 +2111,11 @@ class MainWindow(WindowShell):
     # 状态与刷新
     # ==================================================================
     def _set_state(self, state: State) -> None:
-        """状态机切换：统一刷新按钮可用性与侧边栏动画。"""
+        """状态机切换：统一刷新按钮可用性、侧边栏动画与任务栏图标徽标。"""
         self.state = state
+        # 任务栏图标叠状态徽标：最小化时也能一眼看出是录着、停着还是放着。
+        # 只换图标、**不动标题**（窗口标题恒为「宏匠」）。
+        self._apply_state_icon()
         recording = state is State.RECORDING
         record_session = state in (State.RECORDING, State.RECORD_PAUSED)
         replaying = state in (State.REPLAYING, State.PAUSED)
@@ -2118,6 +2154,32 @@ class MainWindow(WindowShell):
         else:
             self.btn_start_play.setText("开始回放")
         self._refresh_status()
+
+    #: 状态 -> 任务栏徽标键（见 ui/state_icon.py）；IDLE 不在表里 = 原图标
+    _STATE_BADGE = {
+        State.RECORDING: "recording",
+        State.RECORD_PAUSED: "record_paused",
+        State.REPLAYING: "replaying",
+        State.PAUSED: "paused",
+    }
+
+    def _apply_state_icon(self) -> None:
+        """按当前状态给窗口图标叠一个角标（录制红点 / 琥珀暂停 / 蓝色播放）。
+
+        只改图标，**不改窗口标题**：标题恒为「宏匠」，状态靠任务栏按钮右下角
+        的小徽标表达，最小化时也能一眼分辨是在录、暂停还是在放。
+        """
+        base = getattr(self, "_base_icon", None)
+        if base is None:
+            return
+        try:
+            from ui.state_icon import state_icon
+
+            icon = state_icon(base, self._STATE_BADGE.get(self.state, ""))
+            if icon is not None and not icon.isNull():
+                self.setWindowIcon(icon)
+        except Exception:  # pragma: no cover - 图标绘制失败不应影响状态切换
+            log.debug("刷新状态图标失败", exc_info=True)
 
     def _refresh_status(self) -> None:
         """刷新状态栏的模式、步骤进度、事件数、循环轮数与热键提示。"""
@@ -2199,11 +2261,13 @@ class MainWindow(WindowShell):
             parts.append(f"{key('step_prev')} 上一步")
             parts.append(f"{key('step_reset')} 重置指针")
         else:
+            # 空闲态：只列「现在按了就有效」的键。停止录制在这里按了没有意义，
+            # 所以挪到录制态那两支里显示。
+            parts.append(f"{key('record_start')} 开始录制")
             parts.append(f"{key('play_toggle')} 开始回放")
             parts.append(f"{key('pause_toggle')} 暂停/继续")
             parts.append(f"{key('play_stop')} 停止回放")
             parts.append(f"{key('step_next')}/{key('step_prev')} 单步")
-            parts.append(f"{key('record_stop')} 停止录制")
         text = "　·　".join(parts)
         if self._hotkey_failures:
             text += "　⚠ 部分热键注册失败，请到设置页修改"

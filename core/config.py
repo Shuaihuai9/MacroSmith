@@ -6,7 +6,7 @@
 配置结构（节选）::
 
     {
-      "hotkeys": {"record_stop": "f9", "play_toggle": "f6", ...},
+      "hotkeys": {"record_start": "f12", "record_stop": "f9", "play_toggle": "f6", ...},
       "window":  {"x": null, "y": null, "width": 1000, "height": 700},
       "player":  {"default_mode": "timed", "speed": 1.0, ...},
       "scripts_dir": "data/scripts",
@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 
 #: 所有可配置热键的默认值（键名 -> 默认按键）
 DEFAULT_HOTKEYS: dict[str, str] = {
+    "record_start": "f12",   # 开始录制
     "record_stop": "f9",     # 停止录制
     "record_pause": "f11",   # 暂停/继续录制
     "play_toggle": "f6",     # 模式一：开始回放
@@ -51,6 +52,7 @@ DEFAULT_HOTKEYS: dict[str, str] = {
 
 #: 热键的界面显示名与说明
 HOTKEY_LABELS: dict[str, tuple[str, str]] = {
+    "record_start": ("开始录制", "空闲时立即开始录制，等同点「开始录制」按钮"),
     "record_stop": ("停止录制", "录制过程中结束录制并保存事件序列"),
     "record_pause": ("暂停 / 继续录制", "录制过程中暂停采集，再次按下继续（暂停时长不计入脚本）"),
     "play_toggle": ("开始回放", "模式一：按录制时的时间间隔原速回放"),
