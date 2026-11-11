@@ -134,6 +134,8 @@ class MacroPlayer:
         self._paused = False
         self._replaying = False
         self._position = 0                       # 已执行到的原始事件下标
+        #: 本次回放的起始事件下标（只有第一轮从这里起跑，后续轮从头）
+        self._start_index = 0
 
         # 循环回放（只对模式一有效）
         self._loop_mode = LOOP_NONE
@@ -277,6 +279,7 @@ class MacroPlayer:
         """
         self.stop()
         self._position = 0
+        self._start_index = 0
         self._step_index = 0
         self._raw_cursor = 0
         self._loop_round = 0
@@ -324,6 +327,9 @@ class MacroPlayer:
             self.speed = max(0.1, min(10.0, float(speed)))
         self.mode = MODE_TIMED
         self._position = max(0, min(int(from_index), len(self._events) - 1))
+        # 主循环会在每轮开头重置 _position，必须单独记下起始下标，
+        # 否则「从中间开始回放」会被立刻覆盖成 0（历史遗留 bug，2026-11-11 修）
+        self._start_index = self._position
         self._stop_requested = False
         self._paused = False
         self._replaying = True
@@ -391,9 +397,11 @@ class MacroPlayer:
             completed_all = True
             while True:
                 self._loop_round += 1
-                self._position = 0
-                self._restore_state(0)
-                base_t = int(self._events[0].get("t") or 0)
+                # 第一轮从 start_index 起跑（支持「接着上次位置继续放」），
+                # 后续轮次一律从头，循环才完整。
+                self._position = self._start_index if self._loop_round == 1 else 0
+                self._restore_state(self._position)
+                base_t = int(self._events[self._position].get("t") or 0)
                 t0 = time.monotonic()
                 paused_total = 0.0
                 finished_pass = False
@@ -568,8 +576,13 @@ class MacroPlayer:
         self.pause()
         return True
 
-    def stop(self, join_timeout: float = 1.0) -> None:
-        """停止回放并把指针归零。"""
+    def stop(self, join_timeout: float = 1.0, preserve_pointer: bool = False) -> None:
+        """停止回放。
+
+        ``preserve_pointer=True`` 时**不归零**执行指针（模式一事件位置 + 模式二
+        步数），用于「回放暂停 → 切单步」的接力：只终止线程，让用户接着往下走。
+        默认（False）是用户主动停止，指针归零，下次从头开始。
+        """
         self._stop_requested = True
         self._paused = False
         self._wake.set()
@@ -579,12 +592,63 @@ class MacroPlayer:
         self._thread = None
         self._replaying = False
         self._paused = False
-        self._position = 0
+        if not preserve_pointer:
+            self._position = 0
+            self._start_index = 0
+            self._step_index = 0
         self._release_all()
 
     # ==================================================================
     # 模式二：单步热键执行
     # ==================================================================
+    def align_step_index_to_position(self) -> int:
+        """把模式二的步数指针对齐到模式一的当前事件位置，返回对齐后的步数。
+
+        **只把整步跑完的步骤算作已完成**：暂停点落在某步中间时，该步算未完成，
+        单步从那一步的**开头**重跑 —— 步骤是单步的最小单位，不做"半步"
+        （用户 2026-11-11 确认的取舍）。
+        """
+        steps = self._steps
+        if not steps:
+            self._step_index = 0
+            return 0
+        position = int(self._position)
+        done = 0
+        for step in steps:
+            if int(step.raw_end) <= position:
+                done += 1
+            else:
+                break
+        self._step_index = done
+        return done
+
+    def position_from_step_index(self) -> int:
+        """模式二的步数指针 → 模式一的起始事件下标。
+
+        指针在末尾（全部走完）时返回 0：此时按「继续回放」就是从头再放一轮
+        （用户 2026-11-11 确认）。
+        """
+        steps = self._steps
+        if not steps or self._step_index >= len(steps):
+            return 0
+        raw = int(steps[max(0, int(self._step_index))].raw_start)
+        return max(0, min(raw, max(0, len(self._events) - 1)))
+
+    def set_step_index(self, index: int) -> int:
+        """直接设定步数指针（越界自动夹紧），并同步模式一的事件位置。
+
+        用于「回放暂停 → 切单步」接力时，在步骤列表被重新同步之后
+        恢复指针：两个指针必须一起改，否则后面按「继续回放」会从错的位置接。
+        """
+        total = len(self._steps)
+        self._step_index = max(0, min(int(index), total))
+        if self._step_index < total:
+            raw = int(self._steps[self._step_index].raw_start)
+            self._position = max(0, min(raw, max(0, len(self._events) - 1)))
+        else:
+            self._position = 0
+        return self._step_index
+
     def step_next(self) -> Optional[int]:
         """执行下一步，返回执行后的步骤指针；已到末尾返回 None。"""
         self.mode = MODE_STEP

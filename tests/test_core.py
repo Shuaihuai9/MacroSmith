@@ -3247,3 +3247,124 @@ class TestSoundCues:
             assert snd.play("replay_start") is False
         finally:
             snd.set_enabled(False)
+
+
+# ===========================================================================
+# 回放位置 ↔ 单步指针 的接力（2026-11-11）
+# ===========================================================================
+class TestPlaybackHandoff:
+    """「回放跑了几步 → 暂停 → 单步」与「单步几步 → 继续回放」之间的位置接力。
+
+    背景：``_enter_step_mode`` 旧实现在切模式前直接 ``stop_replay()``，
+    而 ``stop()`` 把两个指针都归零，于是暂停后按单步永远从第一步重来。
+    现在改成「先对齐 → 带指针停止」，两个指针可以互相换算。
+    """
+
+    @staticmethod
+    def _player(**kwargs) -> MacroPlayer:
+        """4 个独立点击步骤，raw 区间依次是 (0,2)(2,4)(4,6)(6,8)。
+
+        ``CLICK_GAP`` 必须大于 :data:`ep.MULTI_CLICK_GAP_MS`：
+        间隔过近的同点点击会被合并成「双击/连击」一步，步骤数就对不上了。
+        """
+        player = MacroPlayer(**kwargs)
+        events: list[dict] = []
+        for i in range(4):
+            t = i * 300
+            x = 10 + i * 40            # 落点也拉开，避免被判成连击
+            events.append(ep.make_click_event(t, "press", "left", x, 10))
+            events.append(ep.make_click_event(t + 40, "release", "left", x, 10))
+        player.load(events)
+        assert [(s.raw_start, s.raw_end) for s in player.steps] == [
+            (0, 2), (2, 4), (4, 6), (6, 8)], "测试夹具的步骤分组被改动了，请同步断言"
+        return player
+
+    def test_align_counts_whole_steps_only(self):
+        """暂停在某步中间时，那一步算未完成（从步首重跑）。"""
+        player = self._player()
+        player._position = 5                      # 第 3 步跑到一半
+        assert player.align_step_index_to_position() == 2
+
+    def test_align_at_exact_boundary(self):
+        player = self._player()
+        player._position = 4                      # 正好跑完第 2 步
+        assert player.align_step_index_to_position() == 2
+
+    def test_align_at_start_and_end(self):
+        player = self._player()
+        assert player.align_step_index_to_position() == 0
+        player._position = len(player.events)
+        assert player.align_step_index_to_position() == len(player.steps)
+
+    def test_align_without_steps_is_zero(self):
+        player = MacroPlayer()
+        player._position = 5
+        assert player.align_step_index_to_position() == 0
+
+    def test_position_from_step_index(self):
+        player = self._player()
+        player.set_step_index(2)
+        assert player.position_from_step_index() == player.steps[2].raw_start == 4
+        player.set_step_index(0)
+        assert player.position_from_step_index() == 0
+
+    def test_position_at_end_wraps_to_zero(self):
+        """指针在末尾时「继续回放」= 从头再放一轮。"""
+        player = self._player()
+        player.set_step_index(len(player.steps))
+        assert player.position_from_step_index() == 0
+
+    def test_set_step_index_syncs_position(self):
+        player = self._player()
+        assert player.set_step_index(3) == 3
+        assert player.position == player.steps[3].raw_start == 6
+
+    def test_set_step_index_clamps(self):
+        player = self._player()
+        assert player.set_step_index(99) == len(player.steps)
+        assert player.position == 0               # 末尾 → 位置回到开头
+        assert player.set_step_index(-3) == 0
+        assert player.position == 0
+
+    def test_stop_preserves_pointer_when_asked(self):
+        player = self._player()
+        player.set_step_index(2)
+        player.stop(preserve_pointer=True)
+        assert player.step_index == 2
+        assert player.position == 4
+
+    def test_stop_zeroes_pointer_by_default(self):
+        """用户主动停止仍然归零：下次从头开始，不会半路接着跑。"""
+        player = self._player()
+        player.set_step_index(2)
+        player.stop()
+        assert player.step_index == 0
+        assert player.position == 0
+
+    def test_start_timed_honours_from_index(self):
+        """回归：主循环曾无条件把 ``_position`` 重置成 0，from_index 形同虚设。"""
+        seen: list[int] = []
+        player = self._player(on_event=lambda idx, _evt: seen.append(idx))
+        assert player.start_timed(from_index=6) is True
+        try:
+            deadline = time.monotonic() + 3.0
+            while player.is_replaying and time.monotonic() < deadline:
+                time.sleep(0.02)
+        finally:
+            player.stop()
+        assert seen, "一条事件都没执行"
+        assert seen[0] == 6, f"应从第 6 条事件起跑，实际从 {seen[0]} 起"
+        assert max(seen) == 7
+
+    def test_start_timed_from_zero_is_unchanged(self):
+        """默认从 0 起跑的老行为不能被改坏。"""
+        seen: list[int] = []
+        player = self._player(on_event=lambda idx, _evt: seen.append(idx))
+        assert player.start_timed() is True
+        try:
+            deadline = time.monotonic() + 3.0
+            while player.is_replaying and time.monotonic() < deadline:
+                time.sleep(0.02)
+        finally:
+            player.stop()
+        assert seen[0] == 0

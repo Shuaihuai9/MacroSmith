@@ -222,6 +222,21 @@ def run_startup_check(app, window, log) -> int:
     from core import sound as sound_mod
     sound_ok = (len(sound_mod.CUES) == 9
                 and all(len(sound_mod.wav_bytes(c)) > 44 for c in sound_mod.CUES))
+    # 位置接力：回放指针与单步指针必须能互相换算（回放暂停 → 单步接着走）
+    from core import event_parser as _ep
+    from core.player import MacroPlayer as _ProbePlayer
+    probe_events: list[dict] = []
+    for _i in range(3):
+        _t = _i * 300
+        _x = 10 + _i * 40
+        probe_events.append(_ep.make_click_event(_t, "press", "left", _x, 10))
+        probe_events.append(_ep.make_click_event(_t + 40, "release", "left", _x, 10))
+    probe = _ProbePlayer()
+    probe.load(probe_events)
+    probe._position = 3                      # 探针：假装回放跑到第 2 步中间
+    handoff_ok = (len(probe.steps) == 3
+                  and probe.align_step_index_to_position() == 1   # 半步算未完成
+                  and probe.position_from_step_index() == 2)      # 第 2 步的事件下标
     checks = [
         ("窗口标题", window.windowTitle().startswith("宏匠"), window.windowTitle()),
         ("原生窗口边框", (not (window.windowFlags() & Qt.FramelessWindowHint))
@@ -294,6 +309,9 @@ def run_startup_check(app, window, log) -> int:
         ("状态提示音", sound_ok and window.config.get("sound.enabled", True),
          "开始/暂停/继续/结束 录制与回放 + 单步上下步 各有音型（录制低音区、回放高音区）；"
          "单步有独立开关，停止录制不响"),
+        ("回放↔单步接力", handoff_ok,
+         "回放暂停后按单步接着往下走（半步算未完成，从这一步开头重跑）；"
+         "单步几步后按回放从下一步接着放"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

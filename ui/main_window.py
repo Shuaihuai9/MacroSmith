@@ -959,6 +959,11 @@ class MainWindow(WindowShell):
         if self.state in (State.RECORDING, State.RECORD_PAUSED):
             self._set_message("正在录制中，无法回放。请先按停止录制。")
             return
+        # 暂停中点「继续回放」：接着暂停处放，绝不能重新载入从头开始。
+        # （按钮文案此时就是「继续回放」，语义必须对得上）
+        if self.state is State.PAUSED:
+            self._toggle_pause()
+            return
         events = self._current_events()
         if not events:
             self._set_message("没有可回放的内容，请先录制或载入脚本。")
@@ -975,17 +980,23 @@ class MainWindow(WindowShell):
             self._refresh_status()
             return
 
+        # 接力：模式二单步跑过几步后按回放，从「下一步」接着放（指针在末尾则从头）。
+        # 必须在 player.load() 之前取，load 会把指针清零。
+        from_index = self.player.position_from_step_index()
+        resume_step = self.player.step_index if from_index > 0 else 0
+
         self.player.load(events, self.script_name())
         self.player.speed = float(self.config.get("player.speed", 1.0) or 1.0)
         # 循环设置来自配置（界面上的下拉框会写回配置）
         self.player.set_loop(self.config.loop_mode, self.config.loop_count)
-        if not self.player.start_timed():
+        if not self.player.start_timed(from_index=from_index):
             self._set_message("回放启动失败。")
             return
         self._set_state(State.REPLAYING)
         loop_note = self._loop_note()
+        prefix = f"从第 {resume_step + 1} 步接着回放，" if resume_step else ""
         self._set_message(
-            f"模式一 · 原速回放中（{self.player.speed:g}×）{loop_note}… "
+            f"模式一 · {prefix}原速回放中（{self.player.speed:g}×）{loop_note}… "
             f"{self.hotkeys.binding_display('pause_toggle')} 暂停/继续，"
             f"{self.hotkeys.binding_display('play_stop')} 停止。"
         )
@@ -1048,6 +1059,10 @@ class MainWindow(WindowShell):
         rounds = self.player.loop_rounds_done
         if reason == "finished":
             self._set_state(State.IDLE)
+            # 放完了就把指针收回开头：下次「开始回放」是从第一步放，
+            # 不能沿用上一轮单步留下的位置（否则会莫名其妙从中间开始）
+            self.player.step_reset()
+            self._refresh_step_view()
             if rounds > 1:
                 self._set_message(f"循环回放完成，共执行 {rounds} 轮。")
             else:
@@ -1119,13 +1134,26 @@ class MainWindow(WindowShell):
 
         第九阶段策略：模式一原速回放与模式二单步执行**互斥**。
         若切入模式二时模式一仍在回放/暂停，先停止当前回放
-        （回放线程终止、执行指针归零），再进入单步模式 ——
-        否则两个执行通道会同时向系统注入键鼠事件，行为不可预期。
+        （回放线程终止），再进入单步模式 —— 否则两个执行通道会
+        同时向系统注入键鼠事件，行为不可预期。
         本方法是 step_next / step_prev / step_reset / 双击行跳转
         的共同入口，策略放在这里只维护一份。
+
+        **接力（2026-11-11）**：停止回放时把单步指针对齐到当前回放位置
+        并保留下来，所以「回放跑了几步 → 暂停 → 按下一步」是从暂停处
+        往下走，而不是从第一步重来。暂停点落在某步中间时，该步算未完成，
+        从这一步开头重跑（步骤是单步的最小单位）。
         """
-        if self.state in (State.REPLAYING, State.PAUSED):
-            self.stop_replay()
+        handoff = self.state in (State.REPLAYING, State.PAUSED)
+        aligned: Optional[int] = None
+        if handoff:
+            # 先冻住线程，避免下面几步里回放还在推进位置
+            self.player.pause()
+            aligned = self.player.align_step_index_to_position()
+            self.player.stop(preserve_pointer=True)
+            self._pending_highlights.clear()
+            self.event_list.highlight(-1)
+
         if self.mode_combo.currentData() != MODE_STEP:
             self._initializing = True
             try:
@@ -1133,6 +1161,16 @@ class MainWindow(WindowShell):
             finally:
                 self._initializing = False
         self._sync_player_steps()
+
+        if aligned is not None:
+            # _sync_player_steps 可能重载过步骤（重载会把指针清零），
+            # 所以对齐结果必须在同步之后再写回
+            self.player.set_step_index(aligned)
+            self._set_state(State.IDLE, silent=True)
+            self._set_message(
+                f"已从回放切到单步：接着第 {aligned + 1} 步开始"
+                f"（前面 {aligned} 步已经跑过）。")
+            self._refresh_status()
 
     def _sync_player_steps(self) -> None:
         """确保 ``_script_steps`` 与回放器持有最新（可能被编辑过）的步骤。
@@ -2116,15 +2154,21 @@ class MainWindow(WindowShell):
     # ==================================================================
     # 状态与刷新
     # ==================================================================
-    def _set_state(self, state: State) -> None:
-        """状态机切换：统一刷新按钮可用性、侧边栏动画与任务栏图标徽标。"""
+    def _set_state(self, state: State, *, silent: bool = False) -> None:
+        """状态机切换：统一刷新按钮可用性、侧边栏动画与任务栏图标徽标。
+
+        ``silent=True`` 时不放状态提示音：用于「回放暂停 → 切单步」这类
+        **模式切换**（并非用户要结束回放），紧跟着的单步音已经足够反馈，
+        再补一声「回放结束」反而误导。
+        """
         previous = getattr(self, "state", State.IDLE)
         self.state = state
         # 任务栏图标叠状态徽标：最小化时也能一眼看出是录着、停着还是放着。
         # 只换图标、**不动标题**（窗口标题恒为「宏匠」）。
         self._apply_state_icon()
         # 状态提示音：按钮与热键都走这一个入口，所以挂在这里最省心
-        self._play_state_cue(previous, state)
+        if not silent:
+            self._play_state_cue(previous, state)
         recording = state is State.RECORDING
         record_session = state in (State.RECORDING, State.RECORD_PAUSED)
         replaying = state in (State.REPLAYING, State.PAUSED)

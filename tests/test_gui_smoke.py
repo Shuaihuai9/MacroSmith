@@ -4126,3 +4126,182 @@ class TestMoreCues:
         assert page.chk_step_sound.isEnabled() is True
         assert window.config.get("sound.step_enabled") is True
         assert window.config.get("sound.enabled") is True
+
+
+# ===========================================================================
+# 回放 ↔ 单步 的位置接力
+# ===========================================================================
+class TestHandoffBetweenReplayAndStep:
+    """「回放跑几步 → 暂停 → 按单步」接着走，「单步几步 → 继续回放」接着放。
+
+    旧实现切模式前直接 ``stop_replay()``，而 ``stop()`` 把执行指针归零，
+    于是暂停后按单步永远从第一步重来（用户 2026-11-11 报告的 bug）。
+    现在 ``_enter_step_mode`` 先对齐再带指针停止，两个指针可以互相换算。
+    """
+
+    @staticmethod
+    def _five_steps(window) -> None:
+        """5 个独立点击步骤，raw 区间 (0,2)(2,4)(4,6)(6,8)(8,10)。
+
+        间隔必须大于 ``MULTI_CLICK_GAP_MS``，否则会被并成「连击」一步。
+        """
+        events: list[dict] = []
+        for i in range(5):
+            t = i * 300
+            x = 10 + i * 40
+            events.append(ep.make_click_event(t, "press", "left", x, 10))
+            events.append(ep.make_click_event(t + 40, "release", "left", x, 10))
+        _install_null_controllers(window)
+        _load_into_window(window, events)
+        assert len(window.player.steps) == 5
+
+    @staticmethod
+    def _record_calls(monkeypatch) -> list[str]:
+        calls: list[str] = []
+        monkeypatch.setattr("core.sound.play",
+                            lambda cue: calls.append(cue) or True)
+        return calls
+
+    def test_paused_then_step_continues_from_pause_point(self, window, qapp):
+        """暂停在第 3 步中间（事件 5）→ 下一步应跑第 3 步，而不是第 1 步。"""
+        self._five_steps(window)
+        window.player._position = 5           # 第 3 步（index 2）跑到一半
+        window._set_state(State.PAUSED)
+        _pump(qapp, 20)
+
+        window.step_next()
+        _pump(qapp, 30)
+
+        # 半步算未完成 → 对齐到 2，执行完这一步后指针 = 3
+        assert window.player.step_index == 3, "暂停后单步必须接着走，不能从第一步重来"
+        # 执行的是第 3 步本身（不是第 1 步的描述）
+        assert window.message_label.text() == (
+            f"已执行步骤 3：{window._script_steps[2].description}")
+
+    def test_paused_at_boundary_steps_to_next(self, window, qapp):
+        """正好跑完第 2 步（事件 4）→ 下一步是第 3 步。"""
+        self._five_steps(window)
+        window.player._position = 4
+        window._set_state(State.PAUSED)
+        _pump(qapp, 20)
+
+        window.step_next()
+        _pump(qapp, 30)
+        assert window.player.step_index == 3
+        assert window.mode_combo.currentData() == MODE_STEP
+
+    def test_handoff_message_announces_resume_point(self, window, qapp):
+        """切到单步时要说清「接着第几步」，否则用户以为又从头了。"""
+        self._five_steps(window)
+        window.player._position = 6           # 跑完第 3 步
+        window._set_state(State.REPLAYING)
+        _pump(qapp, 20)
+
+        window._enter_step_mode()
+        _pump(qapp, 20)
+        assert window.player.step_index == 3
+        text = window.message_label.text()
+        assert "接着第 4 步开始" in text
+        assert "3 步已经跑过" in text
+
+    def test_mode_switch_does_not_play_replay_stop(self, window, qapp, monkeypatch):
+        """回放暂停 → 切单步属于模式切换，不该响「回放结束」音。"""
+        calls = self._record_calls(monkeypatch)
+        self._five_steps(window)
+        window.player._position = 4
+        window._set_state(State.PAUSED)
+        _pump(qapp, 20)
+        calls.clear()
+
+        window.step_next()
+        _pump(qapp, 30)
+        assert "replay_stop" not in calls
+        assert calls == ["step_next"]
+
+    def test_steps_then_replay_resumes_from_next_step(self, window, qapp):
+        """单步 2 步后按 F6：从第 3 步对应的原始事件接着放。"""
+        self._five_steps(window)
+        window.step_next()
+        _pump(qapp, 20)
+        window.step_next()
+        _pump(qapp, 20)
+        assert window.player.step_index == 2
+
+        window._on_hotkey_action("play_toggle")       # 等价于 F6
+        _pump(qapp, 40)
+        assert window.mode_combo.currentData() == MODE_TIMED
+        assert window.player.position == 4, "应从第 3 步（事件 4）接着放"
+        assert "接着回放" in window.message_label.text()
+        window.stop_replay()
+        _pump(qapp, 40)
+
+    def test_replay_from_step_end_loops_from_start(self, window, qapp):
+        """指针停在末尾时「继续回放」= 从头再放一轮。"""
+        self._five_steps(window)
+        for _ in range(5):
+            window.step_next()
+            _pump(qapp, 15)
+        assert window.player.step_index == 5
+
+        window._on_hotkey_action("play_toggle")
+        _pump(qapp, 40)
+        assert window.player.position == 0
+        assert "接着回放" not in window.message_label.text()
+        window.stop_replay()
+        _pump(qapp, 40)
+
+    def test_stop_replay_still_zeroes_pointer(self, window, qapp):
+        """用户主动停止保持老行为：指针归零，下次从头开始。"""
+        self._five_steps(window)
+        window.step_next()
+        _pump(qapp, 20)
+        window._set_state(State.REPLAYING)
+        _pump(qapp, 10)
+
+        window.stop_replay()
+        _pump(qapp, 30)
+        assert window.player.step_index == 0
+        assert window.player.position == 0
+
+    def test_finished_replay_zeroes_pointer(self, window, qapp):
+        """自然播完后指针收回开头，不能沿用上一轮单步留下的位置。"""
+        self._five_steps(window)
+        window.step_next()
+        window.step_next()
+        _pump(qapp, 20)
+        assert window.player.step_index == 2
+
+        window._set_state(State.REPLAYING)
+        window._on_player_finished("finished")
+        _pump(qapp, 30)
+        assert window.state is State.IDLE
+        assert window.player.step_index == 0
+
+    def test_real_replay_pause_then_step(self, window, qapp):
+        """真线程回归：无限循环回放跑到中途暂停，再单步必须往前走。"""
+        # 落点拉开到 40px（远超连击容差），保证是 5 个独立步骤而不是被并成一步
+        events: list[dict] = []
+        for i in range(5):
+            t = i * 150
+            x = 10 + i * 40
+            events.append(ep.make_click_event(t, "press", "left", x, 10))
+            events.append(ep.make_click_event(t + 40, "release", "left", x, 10))
+        _install_null_controllers(window)
+        _load_into_window(window, events)
+        assert len(window.player.steps) == 5
+        combo = window.page_library.loop_combo
+        combo.setCurrentIndex(combo.findData("infinite"))
+        window.start_replay()
+        assert _wait_until(qapp, lambda: window.player.position >= 4, 3000)
+
+        window._toggle_pause()
+        _pump(qapp, 40)
+        assert window.state is State.PAUSED
+        paused_position = window.player.position
+
+        window.step_next()
+        _pump(qapp, 40)
+        assert window.state is State.IDLE, "切到单步后不应还挂着回放状态"
+        # 暂停点之后的那一步必须已经执行过（指针前进了，且没回到 0）
+        assert window.player.step_index > 0, "暂停后单步不能从第一步重来"
+        assert window.player.step_index >= paused_position // 2
