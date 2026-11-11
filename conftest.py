@@ -23,6 +23,15 @@ def pytest_configure(config) -> None:
     被测代码里可能通过 ``QTimer.singleShot`` 弹提示框，而 ``exec()`` 会
     一直阻塞事件循环，导致测试挂死。这里在 Qt 可用时统一打桩。
     """
+    # 状态提示音：测试里一律关掉。否则每切一次状态就真的响一声，
+    # 几百条用例跑下来既吵又慢（还要占音频设备）。
+    try:
+        from core import sound
+
+        sound.set_enabled(False)
+    except Exception:  # pragma: no cover - 模块缺失不该影响测试收集
+        pass
+
     try:
         from PySide6.QtWidgets import QMessageBox
     except ImportError:  # pragma: no cover - 未安装 PySide6 时跳过

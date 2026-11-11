@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import struct
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ import pytest
 
 from core import event_parser as ep
 from core import player as pl
+from core import sound as snd
 from core import win_input
 from core.config import DEFAULT_HOTKEYS, HOTKEY_LABELS, Config
 from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
@@ -3119,3 +3121,129 @@ class TestRecordTimeOffset:
             assert rec._stamp() >= 4500
         finally:
             rec.stop()
+
+
+# ===========================================================================
+# 状态提示音（core/sound.py）
+# ===========================================================================
+class TestSoundCues:
+    """提示音的音型定义与 WAV 合成。
+
+    这里不打桩后端：只验证"生成的 PCM 是不是一段合法、可区分的音频"，
+    真发声属于验收范畴（人耳听），自动化测不了。
+    """
+
+    def test_cues_match_labels(self):
+        """每个音型都要有中文说明（设置页/文档靠它对得上）。"""
+        assert set(snd.CUES) == set(snd.CUE_LABELS)
+        assert set(snd.CUES) == {
+            "record_start", "record_pause", "record_resume",
+            "replay_start", "replay_pause", "replay_resume", "replay_stop",
+            "step_next", "step_prev",
+        }
+
+    def test_step_cues_are_separately_switchable(self):
+        """单步两个音必须能单独关掉：它们必须真在 CUES 里，且被 STEP_CUES 标出。"""
+        assert set(snd.STEP_CUES) == {"step_next", "step_prev"}
+        assert set(snd.STEP_CUES) <= set(snd.CUES)
+
+    def test_step_cues_are_short(self):
+        """模式二会连按几十次，单步音必须极短（不超过 80ms）。"""
+        for cue in snd.STEP_CUES:
+            assert snd.duration_ms(cue) <= 80, cue
+
+    def test_replay_stop_descends_three_notes(self):
+        """结束音是三连降：要和"暂停"的两声下行拉开距离。"""
+        stop = [f for f, _ in snd.CUES["replay_stop"]]
+        assert len(stop) == 3
+        assert stop == sorted(stop, reverse=True)
+        assert len(snd.CUES["replay_pause"]) == 2
+
+    def test_step_next_is_higher_than_prev(self):
+        """下一步比上一步高，方向感对得上。"""
+        assert snd.CUES["step_next"][0][0] > snd.CUES["step_prev"][0][0]
+
+    def test_every_segment_is_audible(self):
+        """频率落在人耳舒适区、时长够听见又不至于拖沓。"""
+        for cue, segments in snd.CUES.items():
+            assert segments, cue
+            for freq, ms in segments:
+                assert 300 <= freq <= 3000, f"{cue} 频率 {freq}Hz 不合适"
+                assert 40 <= ms <= 300, f"{cue} 时长 {ms}ms 不合适"
+
+    def test_wav_header_valid(self):
+        """RIFF/WAVE 头必须自洽，否则 PlaySound 会静默不响。"""
+        for cue in snd.CUES:
+            data = snd.wav_bytes(cue)
+            assert data[:4] == b"RIFF"
+            assert data[8:12] == b"WAVE"
+            assert struct.unpack("<I", data[40:44])[0] == len(data) - 44
+
+    def test_duration_matches_definition(self):
+        """实际采样数要和「各段时长 + 段间静默」对得上（误差 < 2ms）。"""
+        for cue, segments in snd.CUES.items():
+            expect = sum(ms for _f, ms in segments) + snd.GAP_MS * (len(segments) - 1)
+            assert snd.duration_ms(cue) == expect
+            frames = (len(snd.wav_bytes(cue)) - 44) // 2
+            assert abs(frames / snd.SAMPLE_RATE * 1000 - expect) < 2
+
+    def test_each_cue_is_distinct(self):
+        """六个音型必须两两不同，否则听不出发生了什么。"""
+        datas = [snd.wav_bytes(cue) for cue in snd.CUES]
+        assert len(set(datas)) == len(datas)
+
+    def test_record_and_replay_use_different_registers(self):
+        """回放整体高一个音区：只靠音高也能分出"在录"还是"在放"。"""
+        for action in ("start", "pause", "resume"):
+            lo = max(f for f, _ in snd.CUES[f"record_{action}"])
+            hi = min(f for f, _ in snd.CUES[f"replay_{action}"])
+            assert lo < hi, f"{action}：回放音区应高于录制"
+
+    def test_pause_is_reverse_of_start(self):
+        """开始是上行、暂停是下行，方向相反才符合直觉。"""
+        for action in ("record", "replay"):
+            start = [f for f, _ in snd.CUES[f"{action}_start"]]
+            pause = [f for f, _ in snd.CUES[f"{action}_pause"]]
+            assert start == list(reversed(pause))
+
+    def test_play_is_silent_when_disabled(self):
+        assert snd.play("record_start") is False
+
+    def test_unknown_cue_is_ignored(self):
+        assert snd.play("no_such_cue") is False
+
+    def test_play_calls_backend_async(self, monkeypatch):
+        """开关打开时应当用异步方式交给系统，不能阻塞调用线程。
+
+        注意必须是「文件 + 异步」：Windows 禁止 ``SND_MEMORY | SND_ASYNC``
+        （实测抛 ``RuntimeError: Cannot play asynchronously from memory``）。
+        """
+        calls = []
+        monkeypatch.setattr(snd, "_available", True)
+        monkeypatch.setattr(snd.winsound, "PlaySound",
+                            lambda data, flags: calls.append((data, flags)))
+        snd.set_enabled(True)
+        try:
+            assert snd.play("record_pause") is True
+        finally:
+            snd.set_enabled(False)
+        assert len(calls) == 1
+        path, flags = calls[0]
+        assert flags & snd.winsound.SND_ASYNC
+        assert flags & snd.winsound.SND_FILENAME
+        assert not (flags & snd.winsound.SND_MEMORY), "内存+异步组合会被系统拒绝"
+        assert Path(path).exists()
+        assert Path(path).read_bytes()[:4] == b"RIFF"
+
+    def test_backend_failure_is_swallowed(self, monkeypatch):
+        """无声卡/设备被独占时不能把异常抛给录制线程。"""
+        def boom(*_a, **_k):
+            raise RuntimeError("no audio device")
+
+        monkeypatch.setattr(snd, "_available", True)
+        monkeypatch.setattr(snd.winsound, "PlaySound", boom)
+        snd.set_enabled(True)
+        try:
+            assert snd.play("replay_start") is False
+        finally:
+            snd.set_enabled(False)

@@ -3882,3 +3882,247 @@ class TestStateIcon:
         _pump(qapp, 10)
         assert window.state is State.REPLAYING
         window._set_state(State.IDLE)
+
+
+# ===========================================================================
+# 状态提示音（core/sound.py 与状态机的接线）
+# ===========================================================================
+class TestStateCues:
+    """状态迁移必须触发对应的提示音，且停止 / 空转不发声。
+
+    这里把 ``core.sound.play`` 打桩成记账，只验"该响哪一个"，
+    真发声（好不好听、会不会破音）只能人耳验收。
+    """
+
+    @staticmethod
+    def _record_calls(monkeypatch) -> list[str]:
+        calls: list[str] = []
+
+        def fake_play(cue: str) -> bool:
+            calls.append(cue)
+            return True
+
+        monkeypatch.setattr("core.sound.play", fake_play)
+        return calls
+
+    @pytest.mark.parametrize("previous,state,cue", [
+        (State.IDLE, State.RECORDING, "record_start"),
+        (State.RECORDING, State.RECORD_PAUSED, "record_pause"),
+        (State.RECORD_PAUSED, State.RECORDING, "record_resume"),
+        (State.IDLE, State.REPLAYING, "replay_start"),
+        (State.REPLAYING, State.PAUSED, "replay_pause"),
+        (State.PAUSED, State.REPLAYING, "replay_resume"),
+    ])
+    def test_transition_plays_expected_cue(self, window, qapp, monkeypatch,
+                                           previous, state, cue):
+        calls = self._record_calls(monkeypatch)
+        window._set_state(previous)
+        _pump(qapp, 10)
+        calls.clear()
+
+        window._set_state(state)
+        _pump(qapp, 10)
+        assert calls == [cue]
+        window._set_state(State.IDLE)
+
+    def test_stop_record_is_silent(self, window, qapp, monkeypatch):
+        """停止录制不发声：那是用户主动按下的确定动作。
+
+        停止回放**会**响（见 TestMoreCues）——回放可能是自然播完的，
+        用户此刻常在看别处。两者取舍不同，别一起改。
+        """
+        calls = self._record_calls(monkeypatch)
+        window._set_state(State.RECORDING)
+        _pump(qapp, 10)
+        calls.clear()
+
+        window._set_state(State.IDLE)
+        _pump(qapp, 10)
+        assert calls == []
+
+    def test_same_state_twice_is_silent(self, window, qapp, monkeypatch):
+        """状态原地不动不能再响（否则误按热键会一直滴滴叫）。"""
+        calls = self._record_calls(monkeypatch)
+        window._set_state(State.RECORDING)
+        _pump(qapp, 10)
+        calls.clear()
+
+        window._set_state(State.RECORDING)
+        _pump(qapp, 10)
+        assert calls == []
+        window._set_state(State.IDLE)
+
+    def test_disabled_in_config_is_silent(self, window, qapp, monkeypatch):
+        """设置页关掉提示音后，所有状态迁移都不出声。"""
+        calls = self._record_calls(monkeypatch)
+        window.config.set("sound.enabled", False)
+
+        for state in (State.RECORDING, State.RECORD_PAUSED, State.IDLE,
+                      State.REPLAYING, State.PAUSED, State.IDLE):
+            window._set_state(state)
+            _pump(qapp, 10)
+        assert calls == []
+
+    def test_sound_defaults_on(self, config):
+        """默认开启（老配置文件深合并后也要有这一项）。"""
+        assert config.get("sound.enabled", None) is True
+
+    def test_settings_checkbox_persists(self, window, qapp):
+        """设置页的「状态提示音」开关能关掉并写回配置。"""
+        page = window.page_settings
+        assert page.chk_sound.isChecked() is True
+
+        page.chk_sound.setChecked(False)
+        page._on_save()
+        _pump(qapp, 20)
+        assert window.config.get("sound.enabled") is False
+        assert page.chk_sound.isChecked() is False
+
+        # 复位，避免影响后续用例（各用例配置独立，这里只是稳妥）
+        page.chk_sound.setChecked(True)
+        page._on_save()
+        _pump(qapp, 20)
+        assert window.config.get("sound.enabled") is True
+
+
+# ===========================================================================
+# 停止回放 / 单步上下步 的提示音
+# ===========================================================================
+class TestMoreCues:
+    """补上「回放结束」与「模式二上下步」，以及单步那个独立开关。"""
+
+    @staticmethod
+    def _record_calls(monkeypatch) -> list[str]:
+        calls: list[str] = []
+
+        def fake_play(cue: str) -> bool:
+            calls.append(cue)
+            return True
+
+        monkeypatch.setattr("core.sound.play", fake_play)
+        return calls
+
+    @pytest.mark.parametrize("previous", [State.REPLAYING, State.PAUSED])
+    def test_replay_stop_cues(self, window, qapp, monkeypatch, previous):
+        """停止回放（含暂停中停止）要响一声「结束」。"""
+        calls = self._record_calls(monkeypatch)
+        window._set_state(previous)
+        _pump(qapp, 10)
+        calls.clear()
+
+        window._set_state(State.IDLE)
+        _pump(qapp, 10)
+        assert calls == ["replay_stop"]
+
+    def test_stop_record_still_silent(self, window, qapp, monkeypatch):
+        """停止录制仍然不发声——只加了停止回放。"""
+        calls = self._record_calls(monkeypatch)
+        window._set_state(State.RECORDING)
+        _pump(qapp, 10)
+        calls.clear()
+
+        window._set_state(State.IDLE)
+        _pump(qapp, 10)
+        assert calls == []
+
+    def _load_two_steps(self, window) -> None:
+        """装两个最简单的步骤，供单步执行用。"""
+        events = [
+            ep.make_move_event(0, 100, 100),
+            ep.make_move_event(120, 200, 200),
+            ep.make_click_event(240, 200, 200),
+        ]
+        _install_null_controllers(window)
+        _load_into_window(window, events)
+        _pump(window.parent() and QApplication.instance(), 30)
+
+    def test_step_next_cues(self, window, qapp, monkeypatch):
+        """模式二按下一步要响 step_next。"""
+        calls = self._record_calls(monkeypatch)
+        _install_null_controllers(window)
+        _load_into_window(window, _sample_events())
+        _pump(qapp, 30)
+        calls.clear()
+
+        window.step_next()
+        _pump(qapp, 30)
+        assert calls == ["step_next"]
+        assert window.state not in (State.RECORDING, State.RECORD_PAUSED)
+
+    def test_step_prev_cues(self, window, qapp, monkeypatch):
+        """模式二按上一步要响 step_prev。"""
+        calls = self._record_calls(monkeypatch)
+        _install_null_controllers(window)
+        _load_into_window(window, _sample_events())
+        _pump(qapp, 30)
+        window.step_next()                 # 先走一步，才谈得上"回退"
+        _pump(qapp, 30)
+        calls.clear()
+
+        window.step_prev()
+        _pump(qapp, 30)
+        assert calls == ["step_prev"]
+
+    def test_step_cue_silent_when_no_steps(self, window, qapp, monkeypatch):
+        """没有步骤时按单步不该响（什么都没执行，响就是误导）。"""
+        calls = self._record_calls(monkeypatch)
+        window.step_next()
+        _pump(qapp, 10)
+        window.step_prev()
+        _pump(qapp, 10)
+        assert calls == []
+
+    def test_step_switch_off_silences_only_steps(self, window, qapp, monkeypatch):
+        """关掉单步开关：上下步不响，但状态提示音照常。"""
+        calls = self._record_calls(monkeypatch)
+        window.config.set("sound.step_enabled", False)
+        _install_null_controllers(window)
+        _load_into_window(window, _sample_events())
+        _pump(qapp, 30)
+        calls.clear()
+
+        window.step_next()
+        _pump(qapp, 30)
+        assert calls == []
+
+        window._set_state(State.REPLAYING)
+        _pump(qapp, 10)
+        assert calls == ["replay_start"]
+        window._set_state(State.IDLE)
+
+    def test_master_switch_off_silences_steps_too(self, window, qapp, monkeypatch):
+        """总开关关掉后，单步提示音也不能漏出来。"""
+        calls = self._record_calls(monkeypatch)
+        window.config.set("sound.enabled", False)
+        _install_null_controllers(window)
+        _load_into_window(window, _sample_events())
+        _pump(qapp, 30)
+        calls.clear()
+
+        window.step_next()
+        _pump(qapp, 30)
+        assert calls == []
+
+    def test_step_sound_checkbox_persists(self, window, qapp):
+        """设置页的单步开关能写回配置，并跟随总开关灰显。"""
+        page = window.page_settings
+        assert page.chk_step_sound.isChecked() is True
+        assert page.chk_step_sound.isEnabled() is True
+
+        page.chk_step_sound.setChecked(False)
+        page._on_save()
+        _pump(qapp, 20)
+        assert window.config.get("sound.step_enabled") is False
+
+        # 总开关关掉 → 子选项灰掉（勾着却没声音会让人困惑）
+        page.chk_sound.setChecked(False)
+        _pump(qapp, 10)
+        assert page.chk_step_sound.isEnabled() is False
+
+        page.chk_sound.setChecked(True)
+        page.chk_step_sound.setChecked(True)
+        page._on_save()
+        _pump(qapp, 20)
+        assert page.chk_step_sound.isEnabled() is True
+        assert window.config.get("sound.step_enabled") is True
+        assert window.config.get("sound.enabled") is True

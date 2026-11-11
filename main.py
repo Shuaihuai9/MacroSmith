@@ -218,6 +218,10 @@ def run_startup_check(app, window, log) -> int:
     badge_icons = {k: state_icon(icon, k) for k in BADGES} if icon is not None else {}
     badge_ok = (len(badge_icons) == 4
                 and all(i is not None and not i.isNull() for i in badge_icons.values()))
+    # 状态提示音：六个音型都要能合成出合法 WAV（合不出来就成了哑巴）
+    from core import sound as sound_mod
+    sound_ok = (len(sound_mod.CUES) == 9
+                and all(len(sound_mod.wav_bytes(c)) > 44 for c in sound_mod.CUES))
     checks = [
         ("窗口标题", window.windowTitle().startswith("宏匠"), window.windowTitle()),
         ("原生窗口边框", (not (window.windowFlags() & Qt.FramelessWindowHint))
@@ -287,6 +291,9 @@ def run_startup_check(app, window, log) -> int:
          "类型下拉 6 种 + 「全选此类型」；表格整行扩展选择，可按住左键框选"),
         ("任务栏状态徽标", badge_ok and window._base_icon is not None,
          "录制红点 / 暂停琥珀双竖条 / 回放绿三角，空闲不叠徽标；只换图标不改标题"),
+        ("状态提示音", sound_ok and window.config.get("sound.enabled", True),
+         "开始/暂停/继续/结束 录制与回放 + 单步上下步 各有音型（录制低音区、回放高音区）；"
+         "单步有独立开关，停止录制不响"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

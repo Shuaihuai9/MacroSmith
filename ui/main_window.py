@@ -1076,6 +1076,7 @@ class MainWindow(WindowShell):
             self._refresh_status()
             return
         self._refresh_step_view()
+        self._play_cue("step_next", step=True)
         if 0 <= result - 1 < len(self._script_steps):
             self._set_message(f"已执行步骤 {result}：{self._script_steps[result - 1].description}")
         else:
@@ -1096,6 +1097,7 @@ class MainWindow(WindowShell):
             self._refresh_status()
             return
         self._refresh_step_view()
+        self._play_cue("step_prev", step=True)
         if result <= 0:
             # 指针退到开头：没有「所在的那一步」可重放
             self._set_message("已回到开头（步骤 0）。")
@@ -1984,7 +1986,11 @@ class MainWindow(WindowShell):
     def _save_options(self, options: dict[str, Any]) -> None:
         """保存录制/回放选项（设置页入口）。"""
         for key, value in options.items():
-            self.config.set(f"player.{key}", value)
+            if "." in key:
+                # 已是完整路径的键（如 sound.enabled）直接写，其余归 player 段
+                self.config.set(key, value)
+            else:
+                self.config.set(f"player.{key}", value)
         self.config.save()
         self._apply_options_from_config()
         self._set_message("设置已保存。")
@@ -2112,10 +2118,13 @@ class MainWindow(WindowShell):
     # ==================================================================
     def _set_state(self, state: State) -> None:
         """状态机切换：统一刷新按钮可用性、侧边栏动画与任务栏图标徽标。"""
+        previous = getattr(self, "state", State.IDLE)
         self.state = state
         # 任务栏图标叠状态徽标：最小化时也能一眼看出是录着、停着还是放着。
         # 只换图标、**不动标题**（窗口标题恒为「宏匠」）。
         self._apply_state_icon()
+        # 状态提示音：按钮与热键都走这一个入口，所以挂在这里最省心
+        self._play_state_cue(previous, state)
         recording = state is State.RECORDING
         record_session = state in (State.RECORDING, State.RECORD_PAUSED)
         replaying = state in (State.REPLAYING, State.PAUSED)
@@ -2154,6 +2163,49 @@ class MainWindow(WindowShell):
         else:
             self.btn_start_play.setText("开始回放")
         self._refresh_status()
+
+    #: (上一个状态, 新状态) -> 提示音键（见 core/sound.py）。停止录制不发声音。
+    _STATE_CUE = {
+        (State.IDLE, State.RECORDING): "record_start",
+        (State.RECORDING, State.RECORD_PAUSED): "record_pause",
+        (State.RECORD_PAUSED, State.RECORDING): "record_resume",
+        (State.IDLE, State.REPLAYING): "replay_start",
+        (State.REPLAYING, State.PAUSED): "replay_pause",
+        (State.PAUSED, State.REPLAYING): "replay_resume",
+        # 手动停止与自然播完共用：「放完了」这件事用户常常没在看屏幕
+        (State.REPLAYING, State.IDLE): "replay_stop",
+        (State.PAUSED, State.IDLE): "replay_stop",
+    }
+
+    def _play_state_cue(self, previous: State, state: State) -> None:
+        """按状态迁移放一声提示音（录制低音区、回放高音区，闭着眼也分得清）。
+
+        只有真正"开始 / 暂停 / 继续 / 结束"才响：状态原地不动不响，
+        免得空按热键也一直滴滴叫。停止录制不响（用户主动的确定动作）。
+        """
+        cue = self._STATE_CUE.get((previous, state))
+        if cue:
+            self._play_cue(cue)
+
+    def _play_cue(self, cue: str, *, step: bool = False) -> None:
+        """放一个提示音，并过两道开关。
+
+        ``sound.enabled`` 是总开关；``sound.step_enabled`` 只管单步上下步
+        （模式二调脚本时会连按几十次，很多人希望这里安静）。提示音失败
+        一律静默吞掉，绝不影响录制回放。
+        """
+        config = getattr(self, "config", None)
+        if config is not None:
+            if not config.get("sound.enabled", True):
+                return
+            if step and not config.get("sound.step_enabled", True):
+                return
+        try:
+            from core import sound
+
+            sound.play(cue)
+        except Exception:  # pragma: no cover - 提示音不该影响主流程
+            log.debug("播放提示音失败", exc_info=True)
 
     #: 状态 -> 任务栏徽标键（见 ui/state_icon.py）；IDLE 不在表里 = 原图标
     _STATE_BADGE = {

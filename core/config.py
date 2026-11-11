@@ -85,6 +85,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # 第九阶段起：record_mouse_move / record_clicks_only 已删除，
         # 录制始终记录鼠标移动 + 点击；旧配置文件里的这两个键会被忽略。
     },
+    #: 状态提示音：开始/暂停/继续/结束 录制与回放各响一声（见 core/sound.py）
+    #: ``step_enabled`` 是模式二「上一步 / 下一步」的独立开关（连按时可能嫌吵）
+    "sound": {"enabled": True, "step_enabled": True},
     "scripts_dir": "data/scripts",
     "last_script": None,
 }

@@ -239,6 +239,33 @@ class SettingsPage(QWidget):
         self.edit_scripts.setReadOnly(True)
         self.edit_scripts.setToolTip("脚本 JSON 的存放目录（由配置文件决定）")
         opt_form.addRow("脚本目录", self.edit_scripts)
+
+        self.chk_sound = QCheckBox("状态提示音")
+        self.chk_sound.setToolTip(
+            "开始 / 暂停 / 继续 / 结束 录制与回放时各响一声：\n"
+            "录制是低音区（上行＝开始、下行＝暂停、单声＝继续），\n"
+            "回放是高音区（另外结束时是三连降），同一个动作换音区，\n"
+            "闭着眼也能分清在录还是在放。停止录制不发声。"
+        )
+        opt_form.addRow("", self.chk_sound)
+
+        # 单步提示音：模式二连按十几次，很多人希望这里安静，所以给独立开关
+        self.chk_step_sound = QCheckBox("单步上下步也发提示音")
+        self.chk_step_sound.setToolTip(
+            "模式二下按「上一步 / 下一步」热键时各响一个极短的提示音\n"
+            "（下一步高一点、上一步低一点），确认按键真的生效了。\n"
+            "连按几十次时可能会觉得吵，可单独关掉这一项。\n"
+            "总开关「状态提示音」关闭时，本项也一并失效。"
+        )
+        step_sound_row = QWidget()
+        step_sound_layout = QHBoxLayout(step_sound_row)
+        step_sound_layout.setContentsMargins(22, 0, 0, 0)   # 缩进，表明从属于上一项
+        step_sound_layout.setSpacing(0)
+        step_sound_layout.addWidget(self.chk_step_sound)
+        step_sound_layout.addStretch(1)
+        opt_form.addRow("", step_sound_row)
+        # 总开关关掉时，子选项跟着灰掉，避免「勾着却没声音」的困惑
+        self.chk_sound.toggled.connect(self.chk_step_sound.setEnabled)
         layout.addWidget(group_opt)
 
         # ------------------------- 智能合并 -------------------------
@@ -317,6 +344,9 @@ class SettingsPage(QWidget):
         self.spin_distance.setValue(int(player.get("move_min_distance_px", 2)))
         self.spin_speed.setValue(float(player.get("speed", 1.0)))
         self.edit_scripts.setText(str(config.scripts_path()))
+        self.chk_sound.setChecked(bool(config.get("sound.enabled", True)))
+        self.chk_step_sound.setChecked(bool(config.get("sound.step_enabled", True)))
+        self.chk_step_sound.setEnabled(self.chk_sound.isChecked())
 
     def _on_exclusive_toggled(self, checked: bool) -> None:
         """独占开关立即生效（不必等“保存设置”），因为它影响热键注册方式。"""
@@ -355,4 +385,8 @@ class SettingsPage(QWidget):
             "move_min_interval_ms": self.spin_interval.value(),
             "move_min_distance_px": self.spin_distance.value(),
             "speed": self.spin_speed.value(),
+            # 带点的键是完整配置路径（提示音不在 player 段下），
+            # 主窗口的 _save_options 会识别后再决定是否加 player. 前缀
+            "sound.enabled": self.chk_sound.isChecked(),
+            "sound.step_enabled": self.chk_step_sound.isChecked(),
         })
