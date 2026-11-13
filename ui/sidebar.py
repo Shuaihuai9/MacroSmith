@@ -130,12 +130,15 @@ class IconButton(QWidget):
 class Sidebar(QWidget):
     """浅色导航侧边栏。
 
-    导航项：回放与脚本 / 录制与步骤编辑 / 设置 / 关于。
-    回放没有独立页面（入口是录制页的按钮与全局热键），因此不再单列一项。
+    导航项顺序：回放与脚本 / 录制与步骤编辑 / **快捷输入** / 设置 / 关于。
+    快捷输入是 2026-11-13 从设置页里独立出来的一级页面——它有自己的一整套
+    热键与设置，混在设置页里「一页只干一件事」就不成立了。
+    回放没有独立页面（入口是录制页的按钮与全局热键），因此不单列一项。
     """
 
     record_clicked = Signal()
     library_clicked = Signal()
+    quick_clicked = Signal()
     settings_clicked = Signal()
     about_clicked = Signal()
 
@@ -162,12 +165,16 @@ class Sidebar(QWidget):
             "回放与脚本（选择脚本 · 循环设置 · 开始/停止回放）", self)
         self.btn_record = IconButton(
             icons.ICON_RECORD, "录制与步骤编辑（F11 暂停/继续 · F9 停止录制）", self)
+        self.btn_quick = IconButton(
+            icons.ICON_KEYBOARD,
+            "快捷输入（F1 敲剪贴板 · F2–F4 敲快捷密码）", self)
         self.btn_settings = IconButton(icons.ICON_SETTINGS, "设置（热键与录制选项）", self)
         self.btn_about = IconButton(icons.ICON_ABOUT, "关于 宏匠", self)
 
         self._buttons = {
             "library": self.btn_library,
             "record": self.btn_record,
+            "quick": self.btn_quick,
             "settings": self.btn_settings,
             "about": self.btn_about,
         }
@@ -178,6 +185,7 @@ class Sidebar(QWidget):
 
         self.btn_record.clicked.connect(self.record_clicked.emit)
         self.btn_library.clicked.connect(self.library_clicked.emit)
+        self.btn_quick.clicked.connect(self.quick_clicked.emit)
         self.btn_settings.clicked.connect(self.settings_clicked.emit)
         self.btn_about.clicked.connect(self.about_clicked.emit)
 

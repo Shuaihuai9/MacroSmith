@@ -360,8 +360,9 @@ class HotkeyManager:
         返回 True 表示命中已注册热键：钩子会吃掉事件，前台程序收不到。
         """
         if self._is_executing():
-            # 程序自己注入的按键不应被拦（钩子已按 LLKHF_INJECTED 过滤，
-            # 这里是第二道保险）
+            # 程序自己注入的按键不应被拦（钩子已按 ``INJECT_TAG`` 认领过，
+            # 这里是第二道保险）。★ 别再按 ``LLKHF_INJECTED`` 判断——那个标志
+            # 连「安全软件重新注入的真人按键」也一起标了，见 hotkey_hook。
             return False
         with self._lock:
             return vk in self._vkmap
@@ -381,12 +382,18 @@ class HotkeyManager:
     # ------------------------------------------------------------------
     # 被动监听回调（监听线程）
     # ------------------------------------------------------------------
-    def _on_press(self, key: Any) -> None:
-        """按键回调（监听线程）：命中绑定则调用动作回调。"""
+    def _on_press(self, key: Any, injected: bool = False) -> None:
+        """按键回调（监听线程）：命中绑定则调用动作回调。
+
+        ``injected`` 是 pynput 传进来的「这个事件是不是程序自己注入的」。
+        **必须声明这个形参**——pynput 的 ``_wrap`` 按回调形参个数裁剪实参，
+        少一个就等于放弃这个信息。注入的按键不能触发热键，否则「快捷输入
+        敲出来的字母」会碰巧命中用户绑的单键热键（例如把热键绑到 ``a``）。
+        """
         try:
-            # 程序自己注入的按键忽略掉，避免“回放 -> 触发热键 -> 再回放”的自我循环。
-            # （pynput 在 Windows 上已用 LLKHF_INJECTED 过滤注入事件，这里是第二道保险。）
-            if self._is_executing():
+            # 程序自己注入的按键忽略掉，避免“回放/快捷输入 -> 触发热键 -> 再回放”
+            # 的自我循环。``_is_executing`` 是另一道闸门（回放期间整体静音）。
+            if injected or self._is_executing():
                 return
             with self._lock:
                 action = self._keymap.get(key)

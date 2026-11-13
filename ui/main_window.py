@@ -15,6 +15,8 @@
 import logging
 import os
 import re
+import threading
+import time
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -25,7 +27,11 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout,
                                QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
 from core import event_parser as ep
-from core.config import Config, HOTKEY_LABELS
+from core import quick_input as qi
+from core import win_input
+from core.config import (Config, DEFAULT_HOTKEYS, HOTKEY_LABELS,
+                         QUICK_HOTKEY_ACTIONS, QUICK_HOTKEY_LABELS,
+                         QUICK_PASSWORD_SLOTS)
 from core.hotkey_manager import HotkeyManager, display_name, key_to_vk, parse_key
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import DEFAULT_IGNORED_KEYS, Recorder
@@ -34,6 +40,7 @@ from ui import icons, styles
 from ui.event_list import EventListWidget, _make_icon
 from ui.frameless import WindowShell
 from ui.script_manager import ScriptManagerPage
+from ui.quick_page import QuickInputPage
 from ui.settings import SettingsPage
 from ui.sidebar import Sidebar
 from ui.name_dialog import ask_name, script_stems
@@ -49,10 +56,12 @@ APP_VERSION = "1.2.0"
 #: 内容区页面下标
 #: 页面下标。第六阶段把「脚本库」上移为第一页并改名为「回放与脚本」：
 #: 日常使用的入口放在最前面，降低「停在录制页误覆写已保存脚本」的风险。
+#: 2026-11-13：快捷输入从设置页独立出来，插在第三位，设置/关于顺延。
 PAGE_SCRIPTS = 0      # 回放与脚本（默认页）
 PAGE_RECORD = 1       # 录制与步骤编辑
-PAGE_SETTINGS = 2
-PAGE_ABOUT = 3
+PAGE_QUICK = 2        # 快捷输入（文本模拟打字）
+PAGE_SETTINGS = 3
+PAGE_ABOUT = 4
 #: 向后兼容别名（旧代码/测试里用 PAGE_LIBRARY 指脚本页）
 PAGE_LIBRARY = PAGE_SCRIPTS
 
@@ -119,6 +128,7 @@ class MainWindow(WindowShell):
     sig_player_error = Signal(str)
     sig_poll_stop = Signal()             # 兼容轮询通道检测到停止热键（轮询线程）
     sig_poll_pause = Signal()            # 兼容轮询通道检测到暂停/继续热键（轮询线程）
+    sig_quick_done = Signal(str)         # 快捷输入敲完（打字线程 -> 主线程）
 
     def __init__(self, config: Optional[Config] = None) -> None:
         super().__init__(WINDOW_TITLE)
@@ -227,10 +237,13 @@ class MainWindow(WindowShell):
 
         self.page_record = self._build_record_page()
         self.page_library = ScriptManagerPage(self.pages)
+        self.page_quick = QuickInputPage(self.pages)
         self.page_settings = SettingsPage(self.pages)
         self.page_about = self._build_about_page()
-        for page in (self.page_library, self.page_record, self.page_settings,
-                     self.page_about):
+        # 顺序必须与 PAGE_* 常量、侧边栏按钮顺序**三处一致**：
+        # 索引写错不会报错，只会静默地把用户带到错误的页面。
+        for page in (self.page_library, self.page_record, self.page_quick,
+                     self.page_settings, self.page_about):
             self.pages.addWidget(page)
         self.pages.setCurrentIndex(PAGE_SCRIPTS)
 
@@ -460,6 +473,10 @@ class MainWindow(WindowShell):
             "· 模式一 原速回放：按录制时的间隔重现全部操作，支持暂停与停止",
             "· 模式二 单步热键：按操作单元逐步执行，PageUp/PageDown 控制进度",
             "· 回放期间程序注入的事件会被自动忽略，不会二次录制",
+            "· 快捷输入：按 F1–F4 把一段文本逐字符「敲」进当前输入框，不走剪贴板，"
+            "密码框 / 远程桌面 / 禁止粘贴的输入框都能用（默认关闭，需手动开启）",
+            "· 快捷密码：三个槽各配一个热键，密码经 DPAPI + 附加熵加密保存在本机，"
+            "只有宏匠能解出明文",
         ]
         for text in lines:
             label = QLabel(text)
@@ -519,6 +536,7 @@ class MainWindow(WindowShell):
         # 侧边栏
         self.sidebar.record_clicked.connect(lambda: self._show_page(PAGE_RECORD))
         self.sidebar.library_clicked.connect(lambda: self._show_page(PAGE_SCRIPTS))
+        self.sidebar.quick_clicked.connect(lambda: self._show_page(PAGE_QUICK))
         self.sidebar.settings_clicked.connect(lambda: self._show_page(PAGE_SETTINGS))
         self.sidebar.about_clicked.connect(lambda: self._show_page(PAGE_ABOUT))
 
@@ -562,6 +580,9 @@ class MainWindow(WindowShell):
         self.page_settings.options_saved.connect(self._save_options)
         self.page_settings.exclusive_toggled.connect(self._on_exclusive_toggled)
         self.page_settings.merge_changed.connect(self._on_merge_changed)
+        # 快捷输入页：保存（含密码/通道/热键）与总开关（立即生效）
+        self.page_quick.save_requested.connect(self._save_quick_page)
+        self.page_quick.enabled_toggled.connect(self._on_quick_enabled_toggled)
 
         # 跨线程信号（Qt 会按 AutoConnection 自动排队到主线程执行）
         self.sig_recorded.connect(self._on_recorded_on_ui)
@@ -570,10 +591,24 @@ class MainWindow(WindowShell):
         self.sig_player_finished.connect(self._on_player_finished)
         self.sig_player_error.connect(self._on_error)
         self.sig_hotkey.connect(self._on_hotkey_action)
+        self.sig_quick_done.connect(self._set_message)
 
     # ==================================================================
     # 热键
     # ==================================================================
+    def _hotkey_bindings(self) -> dict[str, str]:
+        """当前**应当注册**的热键全表。
+
+        快捷输入那四条不能无条件注册：F1/F2/F3 在多数软件里另有用途，
+        总开关关着还去占键，用户会觉得「键盘坏了」。具体取舍见
+        :meth:`core.config.Config.quick_hotkey_bindings`。
+        """
+        bindings = {action: token for action, token
+                    in self.config.hotkeys.items()
+                    if action not in QUICK_HOTKEY_ACTIONS}
+        bindings.update(self.config.quick_hotkey_bindings())
+        return bindings
+
     def _register_hotkeys(self) -> None:
         """按配置重新注册全部全局热键，失败时提示用户改键。"""
         callbacks = {
@@ -587,13 +622,18 @@ class MainWindow(WindowShell):
             "step_prev": lambda: self.sig_hotkey.emit("step_prev"),
             "step_reset": lambda: self.sig_hotkey.emit("step_reset"),
         }
+        # 快捷输入：四个动作走同一条分发，具体敲什么由 _handle_quick_input 判断
+        for action in QUICK_HOTKEY_ACTIONS:
+            callbacks[action] = (
+                lambda a=action: self.sig_hotkey.emit(a))
         for action, callback in callbacks.items():
             self.hotkeys.set_callback(action, callback)
 
         # 独占模式由配置决定（用户可在设置页开关）
         self.hotkeys.set_exclusive(self.config.hotkey_exclusive)
 
-        failed = self.hotkeys.register_all(self.config.hotkeys)
+        bindings = self._hotkey_bindings()
+        failed = self.hotkeys.register_all(bindings)
         # register_all 内部会在需要时重挂；这里保证「首次启动」也走同一路径，
         # 独占失败时 restart() 会自动退化到普通监听，热键不会失效。
         started = True
@@ -601,15 +641,13 @@ class MainWindow(WindowShell):
             started = self.hotkeys.restart()
         degraded = started and not self.hotkeys.exclusive
         if not started:
-            failed = list(self.config.hotkeys.keys())
+            failed = list(bindings.keys())
             err = getattr(self.hotkeys, "_last_error", "") or "未知原因"
             self._set_message(f"全局热键启动失败（{err}），请到“设置”页检查。")
         self._hotkey_failures = sorted(set(failed))
 
         if self._hotkey_failures:
-            names = "、".join(
-                HOTKEY_LABELS.get(a, (a, ""))[0] for a in self._hotkey_failures
-            )
+            names = "、".join(self._hotkey_name(a) for a in self._hotkey_failures)
             self._set_message(f"以下热键注册失败：{names}。请到“设置”页改用其它按键。")
             QTimer.singleShot(300, lambda: self._warn_hotkey_failure(names))
         elif self.hotkeys.exclusive:
@@ -622,6 +660,14 @@ class MainWindow(WindowShell):
                 "热键可用，但按键仍会传给前台程序。"
             )
         self._refresh_hotkey_hint()
+
+    @staticmethod
+    def _hotkey_name(action: str) -> str:
+        """动作名 -> 给人看的名字（两套标签表都查一遍）。"""
+        label = HOTKEY_LABELS.get(action)
+        if label:
+            return label[0]
+        return QUICK_HOTKEY_LABELS.get(action, action)
 
     def _check_exclusive_health(self) -> None:
         """检查独占钩子是否真的在生效，失效时给出可操作的建议。"""
@@ -670,6 +716,14 @@ class MainWindow(WindowShell):
         """
         if action == "record_start":
             self._start_recording_by_hotkey()
+            return
+        # 快捷输入：与录制/回放状态机完全解耦，先走自己的分支
+        if action in QUICK_HOTKEY_ACTIONS:
+            # 这一行是「按了热键没反应」的分水岭：钩子那侧有
+            # 「钩子看到按键」的日志，能走到这里说明热键确实触发了，
+            # 问题就只可能在下面的守卫或注入环节。
+            log.info("热键动作：%s（状态=%s）", action, self.state.value)
+            self._handle_quick_input(action)
             return
         if action == "record_stop":
             if self.state in (State.RECORDING, State.RECORD_PAUSED):
@@ -745,6 +799,225 @@ class MainWindow(WindowShell):
             return
         self.start_recording()
 
+    # ==================================================================
+    # 快捷输入（文本模拟打字）
+    # ==================================================================
+    def _handle_quick_input(self, action: str) -> None:
+        """快捷输入热键的统一入口（主线程）。
+
+        三种情况一律拒绝执行并说明原因，绝不让用户「按了没反应」：
+        录制中、总开关关闭、来源为空（剪贴板非文本 / 密码没填）。
+
+        **录制期间直接忽略**：注入的按键本身带 ``LLKHF_INJECTED``，录制器本来
+        就收不到；但让程序边录边往目标窗口里灌字符，用户会搞不清自己录到了
+        什么，所以这里更彻底一点——一个字符都不打。
+        """
+        if self.state in (State.RECORDING, State.RECORD_PAUSED):
+            log.info("快捷输入被忽略：正在录制（%s）", action)
+            self._set_message("录制中已忽略快捷输入：这些按键不会录进脚本。")
+            return
+        if not self.config.quick_input_enabled:
+            log.info("快捷输入被忽略：总开关关闭（%s）", action)
+            self._set_message(
+                "快捷输入总开关是关的。请到侧边栏「快捷输入」页勾选"
+                "「启用快捷输入」后重新注册热键。")
+            return
+
+        if action == "quick_paste":
+            source = "剪贴板"
+            text = qi.read_clipboard_text()
+            if not text:
+                self._set_message(
+                    "剪贴板里没有可敲入的文本（可能是图片/文件，或"
+                    "剪贴板正被其它程序占用）。")
+                return
+        else:
+            try:
+                index = QUICK_HOTKEY_ACTIONS.index(action)
+            except ValueError:                      # pragma: no cover - 防御
+                return
+            source = f"快捷密码 {index}"
+            text = self.config.quick_password(QUICK_PASSWORD_SLOTS[index - 1])
+            if not text:
+                log.info("快捷输入被忽略：%s 为空（可能保存时没填，或 DPAPI 解不开）", source)
+                self._set_message(
+                    f"{source}还是空的。请到侧边栏「快捷输入」页填好密码并保存。")
+                return
+
+        if not qi.sanitize(text):
+            log.info("快捷输入被忽略：%s 里没有可敲的 ASCII 字符", source)
+            self._set_message(
+                f"{source}里没有可模拟输入的字符：本功能只敲半角 ASCII，"
+                f"中文、全角符号、Emoji 会被丢弃。")
+            return
+
+        self._set_message(f"正在敲入{source}：{qi.describe_strokes(text)}…")
+        self._start_quick_typing(text, source)
+
+    def _start_quick_typing(self, text: str, source: str) -> None:
+        """在后台线程逐字符敲击（几十个字符 × 8ms，不该卡住界面）。"""
+        delay = self.config.quick_delay_ms
+        method = self.config.quick_method
+        click_first = self.config.quick_click_first
+        #: 本次实际用的通道，由 type_text 回填（用于状态栏说明）
+        used: dict[str, str] = {}
+
+        def should_stop() -> bool:
+            """打字途中开始录制/回放就收手：剩下的字符不许再进目标窗口。"""
+            return self.state in (State.RECORDING, State.RECORD_PAUSED,
+                                  State.REPLAYING, State.PAUSED)
+
+        def work() -> None:
+            # 打之前先把目标记下来：投不进去时最先要回答的问题就是
+            # 「到底往哪个窗口打的」——焦点跑到自己窗口/终端上是最常见的乌龙，
+            # 而这在状态栏里看不出来，只能看日志。
+            try:
+                from core import direct_input
+
+                target = direct_input.focus_window()
+                log.info("快捷输入目标：hwnd=%s class=%r 通道=%s",
+                         target, direct_input.class_name(target), method)
+            except Exception:  # pragma: no cover - 诊断信息不影响打字
+                log.debug("记录快捷输入目标失败", exc_info=True)
+
+            # 先补一次左键单击：QQ / 腾讯微云 / WeGame 的登录框是页面内输入框
+            # （CEF/Electron 自绘），只有收到真实鼠标按下才把键盘焦点交给页面里
+            # 那个 input；不点它们就把按键直接丢掉，而 SendInput 照样返回成功，
+            # 日志上一点异常都看不出来。代价是**指针必须放在要输入的框上**
+            # （参考工具也是这个规矩）。关掉这个开关就退回「纯键盘」。
+            if click_first:
+                try:
+                    if win_input.cursor_in_window(target):
+                        clicked = win_input.click_left()
+                        log.info("快捷输入：先点一下左键（%s），指针位置 %s",
+                                 "已发出" if clicked else "发送失败",
+                                 win_input.get_cursor_pos())
+                        time.sleep(0.05)   # 给页面一点时间响应 mousedown
+                    else:
+                        # 指针不在目标窗口里：那一下会把焦点抢到别处，宁可不点。
+                        # 把指针与窗口矩形的**实际坐标**都记下来，不然下次看到
+                        # 「跳过补点击」还是不知道是用户手移开了还是判定算错了。
+                        log.info("快捷输入：指针 %s 不在目标窗口 %s 内，跳过补点击"
+                                 "（页面内输入框需要把指针放到输入框上）",
+                                 win_input.get_cursor_pos(),
+                                 win_input.window_rect(target))
+                except Exception:  # pragma: no cover - 点击失败不该拦住打字
+                    log.debug("补点击失败", exc_info=True)
+
+            try:
+                typed = qi.type_text(text, delay_ms=delay, method=method,
+                                     should_stop=should_stop,
+                                     report=lambda ch: used.setdefault("ch", ch))
+            except Exception:  # pragma: no cover - 注入被拦截等极端情况
+                log.exception("快捷输入执行失败")
+                self.sig_quick_done.emit(f"{source}输入失败，详情见日志。")
+                return
+            channel = used.get("ch", "")
+            if channel == "message-failed":
+                # 三条注入通道 + 窗口消息全都不通：多半是权限不够（UIPI，
+                # 目标以管理员身份运行而本程序没有）或目标完全不吃消息
+                # （纯 DirectInput 引擎）。别让用户以为敲成功了。
+                hint = ("请用「以管理员身份运行」启动宏匠后重试"
+                        if not win_input.is_elevated() else
+                        "目标程序的权限比宏匠高，任何模拟输入都进不去")
+                self.sig_quick_done.emit(
+                    f"{source}没能送进去：字符注入、物理按键、扫描码、窗口消息"
+                    f"这四条路都被拦了。{hint}；仍不行就只能复制粘贴。")
+                return
+            note = {"message": "（窗口消息通道）",
+                    "simulate": "（仅扫描码通道）",
+                    "physical": "（物理按键通道）"}.get(channel, "")
+            if typed < len(qi.sanitize(text)):
+                self.sig_quick_done.emit(
+                    f"{source}中途停止（已敲入 {typed} 个字符）{note}。")
+                return
+            self.sig_quick_done.emit(f"{source}已敲入 {typed} 个字符{note}。")
+
+        threading.Thread(target=work, name="quick-input", daemon=True).start()
+
+    def _save_quick_input(self, payload: dict[str, Any]) -> None:
+        """把「快捷输入」的一组值写进配置（**不含热键校验、不重注册**）。
+
+        拆成两步是因为热键要整体查重：调用方先过 :meth:`_save_hotkeys`
+        （``register=False``），再调本方法写密码/通道，最后统一重注册。
+        否则要么绕开查重，要么一次保存重注册两遍（会出现两个钩子）。
+        """
+        self.config.set("quick_input.enabled", bool(payload.get("enabled", False)))
+        self.config.set("quick_input.paste_enabled",
+                        bool(payload.get("paste_enabled", True)))
+        if payload.get("delay_ms") is not None:
+            self.config.set("quick_input.delay_ms", int(payload["delay_ms"]))
+        if payload.get("method"):
+            # 通道必须过 normalize：写进配置的是白名单值，手工改坏的配置
+            # 会在下次启动时被 _sanitize 折回 auto，不至于让打字直接哑掉
+            self.config.set("quick_input.mode",
+                            qi.normalize_method(payload["method"]))
+        if payload.get("click_first") is not None:
+            self.config.set("quick_input.click_first", bool(payload["click_first"]))
+        for slot in QUICK_PASSWORD_SLOTS:
+            if slot in payload.get("passwords", {}):
+                self.config.set_quick_password(slot, payload["passwords"][slot])
+        self.config.save()
+
+    def _save_quick_page(self, payload: dict[str, Any]) -> None:
+        """「快捷输入」页的保存按钮。
+
+        顺序很关键：
+
+        1. 把本页三条热键并进**全量**热键表再校验——只校验本页的话，
+           用户能把 F6 同时绑给「开始回放」和「快捷密码 1」；
+        2. 校验通过后写密码/通道/开关；
+        3. 最后**只重注册一次**（注册什么取决于第 2 步的结果：
+           密码从空变成有值会让对应热键从「不占用」变成「占用」）。
+        """
+        merged = {action: self.config.hotkey(action)
+                  for action in set(DEFAULT_HOTKEYS) | set(self.config.hotkeys)}
+        merged.update(payload.get("hotkeys") or {})
+        if not self._save_hotkeys(merged, register=False):
+            return                      # 校验没通过：一个字段都不写
+        self._save_quick_input(payload)
+        self._register_hotkeys()
+        self.page_quick.load_from_config(self.config)
+        if self.config.quick_input_enabled:
+            active = list(self.config.quick_hotkey_bindings())
+            enabled = "、".join(
+                f"{self.hotkeys.binding_display(a)} {QUICK_HOTKEY_LABELS[a]}"
+                for a in active)
+            if enabled:
+                self._set_message(
+                    f"快捷输入已保存并生效：{enabled}。密码已加密保存在本机。")
+            else:
+                self._set_message(
+                    "快捷输入已保存，但还没有可用的热键：请填一段密码，"
+                    "或勾选「F1 敲入剪贴板内容」。")
+        else:
+            self._set_message("快捷输入已关闭（热键已释放，F1–F4 不再被占用）。")
+
+    def _on_quick_enabled_toggled(self, enabled: bool) -> None:
+        """总开关**立即生效并落盘**，不等「保存」按钮。
+
+        为什么不等：用户勾上开关就去试热键了，若此时还没落盘，重启后开关
+        自己变回关闭，这种「我明明开过」的困惑极难自证。见 ``ui/quick_page``。
+        """
+        self.config.set("quick_input.enabled", bool(enabled))
+        self.config.save()
+        self._register_hotkeys()
+        # ★ 不要在这里 load_from_config：那会把用户正在输入的密码清空
+        if not enabled:
+            self._set_message("快捷输入已关闭：F1–F4 恢复成普通按键。")
+            return
+        active = list(self.config.quick_hotkey_bindings())
+        if active:
+            enabled_text = "、".join(
+                f"{self.hotkeys.binding_display(a)} {QUICK_HOTKEY_LABELS[a]}"
+                for a in active)
+            self._set_message(f"快捷输入已启用并保持：{enabled_text}。")
+        else:
+            # 开着但一条热键都没注册：必须说清楚为什么，否则用户以为功能坏了
+            self._set_message(
+                "快捷输入已启用，但还没有可用的热键：请填一段密码，"
+                "或勾选「F1 敲入剪贴板内容」后保存。")
+
     def start_recording(self, append: bool = False) -> None:
         """开始录制。
 
@@ -806,6 +1079,16 @@ class MainWindow(WindowShell):
         self.recorder.ignored_keys = set(DEFAULT_IGNORED_KEYS)
         for action in ("record_start", "record_stop", "record_pause"):
             token = str(hotkeys.get(action, "")).strip().lower()
+            if token:
+                self.recorder.ignored_keys.add(token)
+            vk = key_to_vk(token) if token else None
+            if isinstance(vk, int):
+                self.recorder.ignored_keys.add(f"vk:{vk}")
+        # 快捷输入热键同理：它们是「控制键」，一旦当了热键就不该再被录进脚本。
+        # 只加**当前真正注册**的那几条——总开关关着时 F1/F2/F3 仍是普通按键，
+        # 用户完全可能想录一段「按 F2 重命名文件」的操作，不能一并屏蔽。
+        for token in self.config.quick_hotkey_bindings().values():
+            token = str(token).strip().lower()
             if token:
                 self.recorder.ignored_keys.add(token)
             vk = key_to_vk(token) if token else None
@@ -1985,19 +2268,26 @@ class MainWindow(WindowShell):
     # ==================================================================
     # 设置页联动
     # ==================================================================
-    def _save_hotkeys(self, hotkeys: dict[str, str]) -> None:
-        """保存热键：先整体校验（可解析 + 不重复），通过后再落盘并重新注册。
+    def _save_hotkeys(self, hotkeys: dict[str, str],
+                      register: bool = True) -> bool:
+        """保存热键：先整体校验（可解析 + 不重复），通过后再落盘。
 
-        校验不通过时**不做任何修改**，避免出现“一半新一半旧”的绑定状态。
+        校验不通过时**不做任何修改**，避免出现“一半新一半旧”的绑定状态；
+        返回 ``False`` 让调用方也能中止后续写入（快捷输入页就是这么用的）。
+
+        ``register=False`` 只落盘、不重挂钩子：调用方还要改别的会影响
+        「该注册哪些热键」的字段（密码、总开关）时用，末尾自己调一次
+        :meth:`_register_hotkeys`——一次保存重挂两遍会留下两个钩子，
+        同一个键就会触发两次。
         """
         parsed = {action: parse_key(token) for action, token in hotkeys.items()}
         bad = [action for action, key in parsed.items() if key is None]
         if bad:
-            names = "、".join(HOTKEY_LABELS.get(a, (a, ""))[0] for a in bad)
+            names = "、".join(self._hotkey_name(a) for a in bad)
             QMessageBox.warning(self, "热键无法识别",
                                 f"以下热键无法识别：\n{names}\n\n"
                                 "请使用功能键（F1–F24）、PageUp/PageDown、Home 或单个字母数字键。")
-            return
+            return False
 
         seen: dict[Any, list[str]] = {}
         for action, key in parsed.items():
@@ -2005,21 +2295,25 @@ class MainWindow(WindowShell):
         duplicates = {key: actions for key, actions in seen.items() if len(actions) > 1}
         if duplicates:
             detail = "\n".join(
-                "、".join(HOTKEY_LABELS.get(a, (a, ""))[0] for a in actions)
+                "、".join(self._hotkey_name(a) for a in actions)
                 + f"  →  {display_name(hotkeys[actions[0]])}"
                 for actions in duplicates.values()
             )
             QMessageBox.warning(self, "热键重复",
                                 f"以下动作使用了相同的按键：\n{detail}\n\n请改成不同的按键。")
-            return
+            return False
 
         for action, token in hotkeys.items():
             self.config.set_hotkey(action, token)
         self.config.save()
+        # 两页各有一部分热键框，都要同步（只更新存在的那些）
         self.page_settings.load_hotkeys(hotkeys)
-        self._register_hotkeys()
-        self._set_message("热键已更新并重新注册。")
-        self._refresh_status()
+        self.page_quick.load_hotkeys(hotkeys)
+        if register:
+            self._register_hotkeys()
+            self._set_message("热键已更新并重新注册。")
+            self._refresh_status()
+        return True
 
     def _save_options(self, options: dict[str, Any]) -> None:
         """保存录制/回放选项（设置页入口）。"""
@@ -2030,7 +2324,7 @@ class MainWindow(WindowShell):
             else:
                 self.config.set(f"player.{key}", value)
         self.config.save()
-        self._apply_options_from_config()
+        self._apply_options_from_config(reload_quick=False)
         self._set_message("设置已保存。")
     def _on_exclusive_toggled(self, exclusive: bool) -> None:
         """切换「热键独占模式」：写配置 → 重挂热键 → 反馈结果。"""
@@ -2103,10 +2397,17 @@ class MainWindow(WindowShell):
             for e in events if isinstance(e, dict)
         ]
 
-    def _apply_options_from_config(self) -> None:
-        """把配置应用到运行时对象与界面。"""
+    def _apply_options_from_config(self, *, reload_quick: bool = True) -> None:
+        """把配置应用到运行时对象与界面。
+
+        ``reload_quick=False``：只刷新录制/回放相关的东西，**不碰快捷输入页**。
+        设置页的「保存设置」走这条路——它一刷新就会把用户正在快捷输入页里
+        敲了一半的密码清空（那种「我刚填完就没了」的体验相当劝退）。
+        """
         self.player.speed = float(self.config.get("player.speed", 1.0) or 1.0)
         self.page_settings.load_from_config(self.config)
+        if reload_quick:
+            self.page_quick.load_from_config(self.config)
         # 循环回放设置
         self.player.set_loop(self.config.loop_mode, self.config.loop_count)
         self.page_library.set_loop(self.config.loop_mode, self.config.loop_count)
@@ -2364,6 +2665,11 @@ class MainWindow(WindowShell):
             parts.append(f"{key('pause_toggle')} 暂停/继续")
             parts.append(f"{key('play_stop')} 停止回放")
             parts.append(f"{key('step_next')}/{key('step_prev')} 单步")
+            quick = self.config.quick_hotkey_bindings()
+            if quick:
+                names = "/".join(key(action) for action in QUICK_HOTKEY_ACTIONS
+                                 if action in quick)
+                parts.append(f"{names} 快捷输入")
         text = "　·　".join(parts)
         if self._hotkey_failures:
             text += "　⚠ 部分热键注册失败，请到设置页修改"
@@ -2467,10 +2773,16 @@ class MainWindow(WindowShell):
         self.pages.setCurrentIndex(index)
         self.sidebar.set_active({
             PAGE_SCRIPTS: "library", PAGE_RECORD: "record",
+            PAGE_QUICK: "quick",
             PAGE_SETTINGS: "settings", PAGE_ABOUT: "about",
         }.get(index, "library"))
         if index == PAGE_SETTINGS:
             self.page_settings.load_from_config(self.config)
+        elif index == PAGE_QUICK:
+            # 刻意**不**在这里 load_from_config：快捷输入页是这几个字段唯一的
+            # 写入方，重载只会把用户没保存的密码/热键改动静默清空。
+            # 需要从配置刷新时由 _apply_options_from_config 或保存流程负责。
+            pass
         elif index == PAGE_SCRIPTS:
             self.refresh_script_library()
             self.page_library.set_playing(self.state in (State.REPLAYING,

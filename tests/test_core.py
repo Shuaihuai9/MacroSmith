@@ -16,13 +16,18 @@ from pathlib import Path
 
 import pytest
 
+from core import direct_input as di
 from core import event_parser as ep
 from core import player as pl
+from core import quick_input as qi
 from core import sound as snd
 from core import win_input
-from core.config import DEFAULT_HOTKEYS, HOTKEY_LABELS, Config
+from core.config import (DEFAULT_HOTKEYS, HOTKEY_LABELS, QUICK_HOTKEY_ACTIONS,
+                         QUICK_PASSWORD_SLOTS, Config)
 from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-                              WM_KEYDOWN, WM_KEYUP, KeyboardHook, hook_supported)
+                              LLKHF_LOWER_IL_INJECTED, WM_KEYDOWN, WM_KEYUP,
+                              KeyboardHook, hook_supported, should_passthrough)
+from core.win_input import INJECT_TAG
 from core.hotkey_manager import HotkeyManager, display_name, normalize_token, parse_key
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import Recorder, key_to_token, token_to_key
@@ -32,6 +37,15 @@ from core.poll_recorder import PollRecorder, _is_blacklisted_process
 # ---------------------------------------------------------------------------
 # 测试替身
 # ---------------------------------------------------------------------------
+def _wait_tail() -> None:
+    """等到「注入尾巴」窗口过去（见 ``player._INJECT_TAIL_S``）。
+
+    注入刚结束时 :attr:`MacroPlayer.is_executing` 仍为 True，这段时间是给
+    异步抵达的钩子事件用的；断言「标志已归零」必须先跨过它。
+    """
+    time.sleep(pl._INJECT_TAIL_S + 0.02)
+
+
 class SpyController:
     """记录注入动作的假控制器。
 
@@ -1283,7 +1297,20 @@ class TestExecutionFlag:
         player.set_controllers(mouse_ctl=SpyController(), keyboard_ctl=SpyController("kbd"))
         player.load([ep.make_move_event(0, 1, 1)], "f")
         player.step_next()
+        # 注入刚结束的一小段仍算「自身事件」：事件抵达钩子是异步的，
+        # 这段尾巴防止迟到事件被录成新步骤（见 _INJECT_TAIL_S）
+        _wait_tail()
         assert player.is_executing is False
+
+    def test_tail_covers_late_events(self):
+        """注入刚结束仍在尾巴窗口内：迟到的事件必须仍被认作自身事件。"""
+        player = MacroPlayer()
+        player.set_controllers(mouse_ctl=SpyController(), keyboard_ctl=SpyController("kbd"))
+        player.load([ep.make_click_event(0, "press", "left", 1, 1)], "f")
+        player.step_next()
+        assert player.is_executing is True          # 尾巴内
+        _wait_tail()
+        assert player.is_executing is False         # 尾巴外
 
     def test_recorder_skips_while_executing(self):
         recorded: list[dict] = []
@@ -1311,6 +1338,7 @@ class TestExecutionFlag:
         player.load([ep.make_click_event(0, "press", "left", 1, 1)], "f")
         player.step_next()
         player.step_next()
+        _wait_tail()
         assert player.is_executing is False
 
 
@@ -1559,6 +1587,20 @@ class TestHotkeyManager:
         mgr._on_press(key)
         assert fired == ["play"]
 
+    def test_injected_key_does_not_fire_hotkey(self):
+        """注入的按键不能碰巧命中单键热键（快捷输入敲 'a' 时 Hotkey=a 会误触）。"""
+        fired: list[str] = []
+        mgr = HotkeyManager(is_executing=lambda: False)
+        mgr.register_all({"play_toggle": "a"})
+        mgr.set_callback("play_toggle", lambda: fired.append("play"))
+
+        key = parse_key("a")
+        mgr._on_press(key, True)          # injected=True -> 忽略
+        assert fired == []
+
+        mgr._on_press(key, False)         # 真实按键 -> 触发
+        assert fired == ["play"]
+
     def test_callback_exception_does_not_crash_listener(self):
         mgr = HotkeyManager()
         mgr.register_all({"play_toggle": "f6"})
@@ -1715,10 +1757,11 @@ class TestKeyboardHook:
     """真实安装钩子，验证返回值语义（1 = 吞掉，0 = 放行）。"""
 
     @staticmethod
-    def _call(hook, vk: int, flags: int = 0, msg: int = WM_KEYDOWN) -> int:
+    def _call(hook, vk: int, flags: int = 0, msg: int = WM_KEYDOWN,
+              extra: int = 0) -> int:
         """用构造的 KBDLLHOOKSTRUCT 直接调用钩子过程。"""
         struct = KBDLLHOOKSTRUCT(vkCode=vk, scanCode=0, flags=flags,
-                                 time=0, dwExtraInfo=0)
+                                 time=0, dwExtraInfo=extra)
         lp = ctypes.cast(ctypes.pointer(struct), ctypes.c_void_p).value
         return hook._hook_proc(HC_ACTION, msg, lp)
 
@@ -1742,12 +1785,51 @@ class TestKeyboardHook:
         finally:
             hook.stop()
 
-    def test_passes_injected_key(self):
-        """带 LLKHF_INJECTED 的按键必须放行，避免模拟输入被自己吞掉。"""
+    def test_passes_own_injected_key(self):
+        """本程序自己注入的按键必须放行，否则回放/快捷输入会再次触发热键。"""
         hook = KeyboardHook(on_hotkey=lambda vk: None, should_block=lambda vk: vk == 0x75)
         assert hook.start(), hook.last_error
         try:
-            assert self._call(hook, 0x75, flags=LLKHF_INJECTED) == 0
+            assert self._call(hook, 0x75, flags=LLKHF_INJECTED,
+                              extra=INJECT_TAG) == 0
+        finally:
+            hook.stop()
+
+    def test_blocks_foreign_injected_key(self):
+        """★ 别人注入的按键要当作真人按键处理（2026-11-12 实测）。
+
+        QQ 游戏大厅登录框在前台时，物理按下的 F2 到达钩子时带着
+        ``LLKHF_INJECTED`` 和 ``dwExtraInfo=0x21``——有一层安全输入组件把真人
+        按键重新注入了。若按 ``LLKHF_INJECTED`` 一刀切放行，热键永远等不到，
+        现象就是「按了没反应、日志一行没有」。
+        """
+        hits: list[int] = []
+        hook = KeyboardHook(on_hotkey=hits.append, should_block=lambda vk: vk == 0x71)
+        assert hook.start(), hook.last_error
+        try:
+            assert self._call(hook, 0x71, flags=LLKHF_INJECTED, extra=0x21) == 1
+            assert hits == [0x71]
+        finally:
+            hook.stop()
+
+    def test_lower_il_injected_key_participates(self):
+        """★ 更低权限进程注入的事件要**当成真人按键**（2026-11-12 19:24 实测）。
+
+        宏匠以管理员运行、QQ 以普通权限运行时，QQ 的安全输入组件把真人按下的
+        F2 重发出来会带 ``LLKHF_LOWER_IL_INJECTED``（``flags=0x12``）。
+        旧规则「LOWER_IL 一律放行」于是把真人按键放走了——热键时灵时不灵，
+        日志一片空白。现在只看 ``dwExtraInfo`` 里的自己的标记。
+        """
+        hits: list[int] = []
+        hook = KeyboardHook(on_hotkey=hits.append, should_block=lambda vk: vk == 0x75)
+        assert hook.start(), hook.last_error
+        try:
+            flags = LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED
+            assert self._call(hook, 0x75, flags=flags, extra=0x21) == 1
+            assert hits == [0x75]
+            # 带自己标记的仍然放行
+            assert self._call(hook, 0x75, flags=flags, extra=INJECT_TAG) == 0
+            assert hits == [0x75]
         finally:
             hook.stop()
 
@@ -1788,6 +1870,41 @@ class TestKeyboardHook:
         hook.stop()
         assert hook.start()               # 可以重新装
         hook.stop()
+
+
+class TestHotkeyPassthroughRule:
+    """放行判定（纯函数，不起钩子）：**只按 dwExtraInfo 认领自己注入的**。"""
+
+    def test_own_injection_passes(self):
+        assert should_passthrough(LLKHF_INJECTED, INJECT_TAG) is True
+
+    def test_foreign_injection_is_treated_as_real_key(self):
+        assert should_passthrough(LLKHF_INJECTED, 0x21) is False
+
+    def test_hardware_key_is_treated_as_real_key(self):
+        assert should_passthrough(0, 0) is False
+
+    def test_lower_il_injection_is_treated_as_real_key(self):
+        """★ 2026-11-12 19:24 实测（用户真机日志）：
+
+        QQ 登录框把真人按下的 F2 重发成
+        ``flags=0x12``（``INJECTED|LOWER_IL_INJECTED``）``extra=0x21``。
+        宏匠是管理员、QQ 是普通权限，所以「更低权限注入」这个标志位反而
+        标在了**真人按键的重发件**上。旧规则「LOWER_IL 一律放行」把它放走，
+        热键永远不触发，日志里连一行快捷输入都没有。
+        """
+        assert should_passthrough(LLKHF_LOWER_IL_INJECTED, 0) is False
+        assert should_passthrough(
+            LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED, 0x21) is False
+
+    def test_lower_il_still_respects_own_tag(self):
+        """带自己标记的仍然放行（高位脏数据不影响）。"""
+        assert should_passthrough(
+            LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED, INJECT_TAG) is True
+
+    def test_tag_survives_high_bits(self):
+        """dwExtraInfo 是 64 位指针宽度：高位垃圾不能把标记弄丢。"""
+        assert should_passthrough(LLKHF_INJECTED, INJECT_TAG | (0xDEAD << 32)) is True
 
 
 class TestExclusiveFallback:
@@ -2446,6 +2563,42 @@ class TestRecorderIgnoreKeys:
         out = rec.stop()
         assert all(e.get("vk") != 120 for e in out), out
         assert len(out) == 2
+
+
+class TestRecorderInjectedEvents:
+    """注入事件**要照常录制**（这是刻意的取舍，别改成"注入即丢弃"）。
+
+    屏幕键盘、远程桌面、键盘改键工具发出的都是注入事件，用户同样希望它们
+    出现在脚本里；``tools/selftest.py`` 也是靠注入模拟真实按键来自检的。
+    "注入即丢弃"会让这些输入全部录不到（第一版实现踩过，selftest 立刻红）。
+
+    防污染靠的是另一条路：快捷输入在录制期间不启动，打字途中一旦开始录制
+    就在下一个字符前收手（见 :func:`core.quick_input.type_text` 的
+    ``should_stop``）。
+    """
+
+    def _recorder(self, events: list[dict]):
+        rec = Recorder(is_executing=lambda: False, on_event=events.append)
+        rec._recording = True
+        rec._t0 = time.monotonic()
+        return rec
+
+    def test_injected_press_is_recorded(self):
+        from pynput import keyboard as kb
+
+        recorded: list[dict] = []
+        rec = self._recorder(recorded)
+        rec._handle_press(kb.KeyCode.from_char("a"), True)
+        rec._handle_release(kb.KeyCode.from_char("a"), True)
+        assert len(recorded) == 2, "注入事件（屏幕键盘/远程桌面）必须能录"
+
+    def test_injected_param_kept_in_signature(self):
+        """回归：形参少于 2 个时 pynput 会裁掉 injected，将来想用还得改签名。"""
+        import inspect
+
+        for name in ("_handle_press", "_handle_release"):
+            params = inspect.signature(getattr(Recorder, name)).parameters
+            assert len(params) >= 2, f"{name} 必须保留 injected 形参"
 
     def test_ignore_keys_configurable(self):
         from pynput import keyboard as kb
@@ -3368,3 +3521,939 @@ class TestPlaybackHandoff:
         finally:
             player.stop()
         assert seen[0] == 0
+
+
+# ===========================================================================
+# 快捷输入（文本模拟打字）
+# ===========================================================================
+class TestQuickInputFilter:
+    """ASCII 过滤：中文、全角、Emoji 一律丢弃，半角符号一个不落。"""
+
+    def test_mixed_chinese_dropped(self):
+        assert qi.sanitize("abc中文123") == "abc123"
+
+    def test_fullwidth_and_emoji_dropped(self):
+        # 全角字母、全角标点、Emoji、制表符/换行都不在键盘按键表里
+        assert qi.sanitize("ＡＢＣ１２３！？\t\n😀🎉") == ""
+
+    def test_keeps_every_printable_ascii(self):
+        """0x20–0x7E 必须原样保留——密码里的 `!@#$%^&*` 一个都不能少。"""
+        printable = "".join(chr(c) for c in range(0x20, 0x7F))
+        assert qi.sanitize(printable) == printable
+
+    def test_control_chars_dropped(self):
+        assert qi.sanitize("a\x00b\x07c\x1b") == "abc"
+
+    def test_none_and_non_string(self):
+        assert qi.sanitize(None) == ""
+        assert qi.sanitize(123) == "123"
+
+    def test_describe_strokes_counts_dropped(self):
+        text = qi.describe_strokes("abc中文")
+        assert "3 个字符" in text and "2 个非 ASCII" in text
+        assert qi.describe_strokes("abc") == "共 3 个字符"
+
+
+class TestQuickInputStrokes:
+    """字符 -> 虚拟键码 的映射（``method="vk"`` 兜底通道用）。"""
+
+    def test_lowercase_no_shift(self):
+        assert qi.char_to_stroke("a") == (0x41, False)
+        assert qi.char_to_stroke("z") == (0x5A, False)
+
+    def test_uppercase_needs_shift(self):
+        assert qi.char_to_stroke("A") == (0x41, True)
+
+    def test_digits(self):
+        assert qi.char_to_stroke("0") == (0x30, False)
+        assert qi.char_to_stroke("9") == (0x39, False)
+
+    def test_shifted_symbols(self):
+        assert qi.char_to_stroke("!") == (0x31, True)
+        assert qi.char_to_stroke("@") == (0x32, True)
+        assert qi.char_to_stroke("?") == (0xBF, True)
+
+    def test_plain_symbols(self):
+        assert qi.char_to_stroke("-") == (0xBD, False)
+        assert qi.char_to_stroke("/") == (0xBF, False)
+        assert qi.char_to_stroke(" ") == (0x20, False)
+
+    def test_oem_keys_are_not_ascii_codes(self):
+        """符号键是 OEM 键，键码与字符编码不是一回事（`-` 不是 0x2D）。"""
+        assert qi.char_to_stroke("-")[0] != ord("-")
+        assert qi.char_to_stroke(";")[0] != ord(";")
+
+    def test_untypable_returns_none(self):
+        assert qi.char_to_stroke("中") is None
+        assert qi.char_to_stroke("😀") is None
+        assert qi.char_to_stroke("\n") is None
+        assert qi.char_to_stroke("") is None
+        assert qi.char_to_stroke("ab") is None
+
+    def test_text_to_strokes_drops_untypable(self):
+        strokes = qi.text_to_strokes("a中b😀c")
+        assert len(strokes) == 3
+        assert [vk for vk, _ in strokes] == [0x41, 0x42, 0x43]
+
+
+class TestQuickInputTyping:
+    """敲击：注入顺序、Shift 包裹、延时、异常中断。"""
+
+    @staticmethod
+    def _capture():
+        calls: list[tuple[int, bool]] = []
+        return calls, (lambda vk, up: calls.append((vk, up)) or True)
+
+    def test_types_lowercase_as_down_up(self):
+        calls, sender = self._capture()
+        typed = qi.type_text("ab", delay_ms=1, method="vk", sender=sender,
+                            sleep=lambda _s: None)
+        assert typed == 2
+        assert calls == [(0x41, False), (0x41, True), (0x42, False), (0x42, True)]
+
+    def test_uppercase_wraps_with_shift(self):
+        calls, sender = self._capture()
+        qi.type_text("A", delay_ms=1, method="vk", sender=sender,
+                       sleep=lambda _s: None)
+        assert calls == [
+            (qi.VK_SHIFT, False), (0x41, False), (0x41, True), (qi.VK_SHIFT, True),
+        ]
+
+    def test_filtered_text_is_shorter(self):
+        """返回值 = 实际敲出的字符数，中英混合时小于原串长度。"""
+        calls, sender = self._capture()
+        typed = qi.type_text("a中b", delay_ms=1, method="vk", sender=sender,
+                            sleep=lambda _s: None)
+        assert typed == 2
+        assert [vk for vk, up in calls if not up] == [0x41, 0x42]
+
+    def test_shift_symbol_sequence(self):
+        calls, sender = self._capture()
+        qi.type_text("!", delay_ms=1, method="vk", sender=sender,
+                       sleep=lambda _s: None)
+        assert calls == [
+            (qi.VK_SHIFT, False), (0x31, False), (0x31, True), (qi.VK_SHIFT, True),
+        ]
+
+    def test_delay_between_chars_only(self):
+        """3 个字符之间只等 2 次；末尾不空等（否则每段输入都白拖一个间隔）。"""
+        waits: list[float] = []
+        _, sender = self._capture()
+        qi.type_text("abc", delay_ms=10, sender=sender, sleep=waits.append)
+        assert waits == [0.01, 0.01]
+
+    def test_delay_clamped(self):
+        waits: list[float] = []
+        _, sender = self._capture()
+        qi.type_text("ab", delay_ms=999, sender=sender, sleep=waits.append)
+        assert waits == [qi.MAX_DELAY_MS / 1000]
+        waits.clear()
+        qi.type_text("ab", delay_ms=0, sender=sender, sleep=waits.append)
+        assert waits == [qi.MIN_DELAY_MS / 1000]
+
+    def test_nothing_to_type(self):
+        calls, sender = self._capture()
+        assert qi.type_text("中文", delay_ms=1, sender=sender,
+                            sleep=lambda _s: None) == 0
+        assert calls == []
+
+    def test_sender_exception_stops_cleanly(self):
+        """注入被安全软件拦掉时不能把线程炸掉，返回已经打出去的字数。"""
+        sent: list[int] = []
+
+        def boom(vk: int, up: bool) -> bool:
+            if len(sent) >= 2:
+                raise OSError("被拦截")
+            sent.append(vk)
+            return True
+
+        typed = qi.type_text("abcd", delay_ms=1, method="vk", sender=boom,
+                            sleep=lambda _s: None)
+        assert typed == 1             # a 敲完，b 开始就抛了
+        assert sent == [0x41, 0x41]
+
+    def test_clamp_delay_bounds(self):
+        assert qi.clamp_delay(5) == 5
+        assert qi.clamp_delay(-3) == qi.MIN_DELAY_MS
+        assert qi.clamp_delay(10_000) == qi.MAX_DELAY_MS
+        assert qi.clamp_delay("bad") == qi.DEFAULT_DELAY_MS
+        assert qi.clamp_delay(None) == qi.DEFAULT_DELAY_MS
+
+    def test_should_stop_aborts_before_next_char(self):
+        """录制/回放一开始，剩下的字符立刻不打了（否则会被录进脚本）。"""
+        calls, sender = self._capture()
+        typed = qi.type_text("abcdef", delay_ms=1, sender=sender,
+                             sleep=lambda _s: None,
+                             should_stop=lambda: len(calls) >= 4)
+        # 每个字符 2 次调用（按下+抬起），敲完 2 个字符后停下
+        assert typed == 2
+        assert len(calls) == 4
+
+    def test_should_stop_at_start_types_nothing(self):
+        calls, sender = self._capture()
+        assert qi.type_text("abc", delay_ms=1, sender=sender,
+                            sleep=lambda _s: None,
+                            should_stop=lambda: True) == 0
+        assert calls == []
+
+
+class TestQuickInputMethods:
+    """两条注入通道：默认 ``physical``（像真键盘），``unicode`` 仍可显式指定。
+
+    为什么还留着 unicode 通道：实测中文输入法开着时，按 vk 发的 `b` 会被拼成
+    「杯」、`;` 变成「；」，密码整段报废；`CapsLock` 亮着时 Shift 大小写还会
+    翻过来。`KEYEVENTF_UNICODE` 把字符直接塞进消息队列，三个坑全绕开——
+    但受保护控件（QQ 密码框）不认它，所以它只能是可选项，不能是默认。
+    """
+
+    @staticmethod
+    def _capture():
+        calls: list[tuple[object, bool]] = []
+        return calls, (lambda payload, up: calls.append((payload, up)) or True)
+
+    def test_default_is_auto(self):
+        assert qi.DEFAULT_METHOD == "auto"
+        assert qi.TYPING_METHODS == ("auto", "unicode", "physical", "simulate",
+                                     "message", "vk")
+
+    def test_normalize_method(self):
+        assert qi.normalize_method("unicode") == "unicode"
+        assert qi.normalize_method("PHYSICAL") == "physical"
+        assert qi.normalize_method("SIMULATE") == "simulate"
+        assert qi.normalize_method("MESSAGE") == "message"
+        assert qi.normalize_method("VK") == "vk"
+        assert qi.normalize_method(" vk ") == "vk"
+        # 写错/缺失一律回落默认，别让打字直接哑掉
+        assert qi.normalize_method("乱写") == "auto"
+        assert qi.normalize_method(None) == "auto"
+
+    def test_unicode_sends_characters_not_keycodes(self):
+        calls, sender = self._capture()
+        typed = qi.type_text("Ab!", delay_ms=1, method="unicode",
+                             sender=sender, sleep=lambda _s: None)
+        assert typed == 3
+        assert calls == [("A", False), ("A", True), ("b", False), ("b", True),
+                         ("!", False), ("!", True)]
+
+    def test_unicode_path_filters_non_ascii(self):
+        calls, sender = self._capture()
+        assert qi.type_text("a中b😀c", delay_ms=1, method="unicode",
+                            sender=sender, sleep=lambda _s: None) == 3
+        assert [ch for ch, up in calls if not up] == ["a", "b", "c"]
+
+    def test_unicode_groups_have_down_and_up(self):
+        assert qi._unicode_groups("ab") == [
+            [("a", False), ("a", True)], [("b", False), ("b", True)],
+        ]
+
+    def test_vk_groups_wrap_uppercase_with_shift(self):
+        assert qi._vk_groups("A") == [
+            [(qi.VK_SHIFT, False), (0x41, False), (0x41, True), (qi.VK_SHIFT, True)],
+        ]
+
+    def test_vk_groups_plain_char_has_no_shift(self):
+        assert qi._vk_groups("a") == [[(0x41, False), (0x41, True)]]
+
+    def test_vk_method_still_works(self):
+        calls, sender = self._capture()
+        qi.type_text("a", delay_ms=1, method="vk", sender=sender,
+                     sleep=lambda _s: None)
+        assert calls == [(0x41, False), (0x41, True)]
+
+    def test_delay_counted_per_character_not_per_event(self):
+        """`!` 在 vk 通道是 4 条事件，但仍只占 1 个字符位——延时按字符算。"""
+        waits: list[float] = []
+        _, sender = self._capture()
+        qi.type_text("!!", delay_ms=10, method="vk", sender=sender,
+                     sleep=waits.append)
+        assert waits == [0.01]
+
+
+class TestQuickInputAutoFallback:
+    """``auto`` 通道：注入被系统拒绝时自动改走窗口消息。
+
+    两级判据（2026-11-12 对照实验后修正）：
+
+    * 注入**整体**被封（``BlockInput`` / 反注入驱动）→ 探针读回 0 → 走窗口消息；
+    * 注入能进系统，但目标只挑食某一种形态 → 探针测不出来，
+      所以第一级直接选最像真键盘的 ``physical``；
+    * 目标收下事件却仍然不显示字符（QQ 密码框收 ``physical`` 就正常）时，
+      ``SendInput`` 没有任何返回码能告诉你，只能靠选对通道规避。
+    """
+
+    def test_auto_picks_physical_by_default(self):
+        """``auto`` + 测试替身：通道是 ``physical``（vk+扫描码），不是字符注入。
+
+        2026-11-12 对照实验：QQ 游戏大厅的密码框拒收 ``KEYEVENTF_UNICODE``，
+        但收任何带真扫描码的按键（参考工具就是这么敲进去的）。所以 auto 的
+        第一级必须改成 ``physical``。
+        """
+        calls: list[tuple[int, bool]] = []
+        seen: list[str] = []
+        typed = qi.type_text(
+            "ab", delay_ms=1,
+            sender=lambda ch, up: calls.append((ch, up)) or True,
+            sleep=lambda _s: None, report=seen.append)
+        assert typed == 2
+        assert seen == ["physical"]
+        assert calls == [(0x41, False), (0x41, True), (0x42, False), (0x42, True)]
+
+    def test_falls_back_to_messages_when_blocked(self, monkeypatch):
+        used: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: used.append(text) or len(qi.sanitize(text)))
+        seen: list[str] = []
+        calls: list[tuple[int, bool]] = []
+        typed = qi.type_text(
+            "ab", delay_ms=1,
+            sender=lambda ch, up: calls.append((ch, up)) or False,
+            sleep=lambda _s: None, report=seen.append)
+        assert typed == 2
+        assert seen == ["message"]
+        assert used == ["ab"], "整段重送，不能只送剩下的"
+        assert calls == [(0x41, False)], "只试一次就切通道，别逐个去撞"
+
+    def test_reports_message_failed_when_nothing_arrives(self, monkeypatch):
+        monkeypatch.setattr("core.direct_input.type_text", lambda text, **kw: 0)
+        seen: list[str] = []
+        assert qi.type_text("ab", delay_ms=1, sender=lambda ch, up: False,
+                            sleep=lambda _s: None, report=seen.append) == 0
+        assert seen == ["message-failed"]
+
+    def test_explicit_unicode_never_falls_back(self, monkeypatch):
+        """钉死 unicode 时不许偷偷换通道——排障要可复现。"""
+        called: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: called.append(text) or 99)
+        typed = qi.type_text("ab", delay_ms=1, method="unicode",
+                             sender=lambda ch, up: False,
+                             sleep=lambda _s: None)
+        assert typed == 2
+        assert called == []
+
+    def test_message_method_skips_sendinput_entirely(self, monkeypatch):
+        called: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: called.append(text) or len(qi.sanitize(text)))
+        seen: list[str] = []
+        assert qi.type_text("ab", delay_ms=1, method="message",
+                            report=seen.append) == 2
+        assert called == ["ab"]
+        assert seen == ["message"]
+
+    # ---- auto 的三级阶梯：物理按键 -> 仅扫描码 -> 窗口消息 ----
+    def test_auto_probes_before_typing(self, monkeypatch):
+        """整段下发之前必须先探针：探不到就别假装敲进去了。"""
+        probes: list[bool] = []
+
+        def fake_probe(*, scancode: bool = False) -> bool:
+            probes.append(scancode)
+            return True
+
+        monkeypatch.setattr(qi, "injection_delivered", fake_probe)
+        calls: list[tuple] = []
+        monkeypatch.setitem(qi._SENDERS, "physical",
+                            lambda payload, up: calls.append(payload) or True)
+        assert qi.type_text("ab", delay_ms=1, sleep=lambda _s: None) == 2
+        assert probes == [False], "第一条通道能用就别再去探扫描码"
+        assert calls == [0x41, 0x41, 0x42, 0x42], "第一级走 physical，下发虚拟键码"
+
+    def test_auto_uses_scancode_when_char_channel_blocked(self, monkeypatch):
+        """字符注入被拦但扫描码能过：走「模拟按键」这一级。"""
+        probes: list[bool] = []
+
+        def fake_probe(*, scancode: bool = False) -> bool:
+            probes.append(scancode)
+            return scancode                    # 字符通道 False，扫描码 True
+
+        monkeypatch.setattr(qi, "injection_delivered", fake_probe)
+        messages: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: messages.append(text) or 0)
+        calls: list[tuple] = []
+        monkeypatch.setitem(qi._SENDERS, "simulate",
+                            lambda payload, up: calls.append((payload, up)) or True)
+        seen: list[str] = []
+        assert qi.type_text("aB", delay_ms=1, sleep=lambda _s: None,
+                            report=seen.append) == 2
+        assert probes == [False, True]
+        assert seen == ["simulate"]
+        assert messages == [], "扫描码通道能用就不该再退到窗口消息"
+        assert calls[0] == (0x41, False), "扫描码通道按虚拟键码下发"
+
+    def test_auto_falls_back_to_messages_when_both_channels_blocked(self, monkeypatch):
+        monkeypatch.setattr(qi, "injection_delivered", lambda **kw: False)
+        used: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: used.append(text) or len(qi.sanitize(text)))
+        seen: list[str] = []
+        assert qi.type_text("ab", delay_ms=1, sleep=lambda _s: None,
+                            report=seen.append) == 2
+        assert used == ["ab"], "两条注入通道都不通时整段改走窗口消息"
+        assert seen == ["message"]
+
+    def test_explicit_physical_uses_full_key_sender(self, monkeypatch):
+        """钉死 physical：走「键码+扫描码」那条，且不探针、不换通道。"""
+        probes: list[bool] = []
+        monkeypatch.setattr(qi, "injection_delivered",
+                            lambda **kw: probes.append(True) or True)
+        calls: list[tuple] = []
+        monkeypatch.setitem(qi._SENDERS, "physical",
+                            lambda payload, up: calls.append((payload, up)) or True)
+        seen: list[str] = []
+        assert qi.type_text("aB", delay_ms=1, method="physical",
+                            sleep=lambda _s: None, report=seen.append) == 2
+        assert probes == []
+        assert seen == ["physical"]
+        assert calls[0] == (0x41, False), "physical 通道按虚拟键码下发"
+
+    def test_explicit_simulate_skips_probing_and_messages(self, monkeypatch):
+        """钉死 simulate 时既不探针也不换通道——排障要可复现。"""
+        probes: list[bool] = []
+        monkeypatch.setattr(qi, "injection_delivered",
+                            lambda **kw: probes.append(True) or True)
+        messages: list[str] = []
+        monkeypatch.setattr("core.direct_input.type_text",
+                            lambda text, **kw: messages.append(text) or 0)
+        calls: list[tuple] = []
+        monkeypatch.setitem(qi._SENDERS, "simulate",
+                            lambda payload, up: calls.append((payload, up)) or True)
+        seen: list[str] = []
+        assert qi.type_text("ab", delay_ms=1, method="simulate",
+                            sleep=lambda _s: None, report=seen.append) == 2
+        assert probes == []
+        assert messages == []
+        assert seen == ["simulate"]
+
+
+class TestDirectInputMessages:
+    """窗口消息通道：lParam 组装、逐字符消息、Edit 阶梯与读回验证。"""
+
+    def test_key_lparam_has_scan_code(self):
+        lp = di.key_lparam(0x41)                 # 'A'
+        assert lp & 0xFFFF == 1                  # 重复次数
+        assert 0 < (lp >> 16) & 0xFF             # 扫描码必须真填
+        assert not lp & (1 << 31)                # 按下：转换位为 0
+
+    def test_key_lparam_up_sets_transition_bits(self):
+        lp = di.key_lparam(0x41, up=True)
+        assert lp & (1 << 30) and lp & (1 << 31)
+
+    def test_type_text_posts_only_char_messages(self, monkeypatch):
+        """每个字符**只发一条** WM_CHAR。
+
+        实测：再补 WM_KEYDOWN/WM_KEYUP 会被界面二次翻译成字符，
+        上屏变成「Ab3!@-;:Q」+「ab312-;;q」两份。
+        """
+        monkeypatch.setattr(di, "is_edit_control", lambda hwnd: False)
+        posted: list[tuple] = []
+        typed = di.type_text("aB", hwnd=1234, delay_ms=1,
+                             post=lambda *a: posted.append(a) or True,
+                             sleep=lambda _s: None)
+        assert typed == 2
+        assert [m for (_h, m, _w, _l) in posted] == [di.WM_CHAR, di.WM_CHAR]
+        assert [chr(w) for (_h, _m, w, _l) in posted] == ["a", "B"]
+        # lParam 仍要带扫描码（部分框架靠它判断重复次数/键位）
+        assert all((_l >> 16) & 0xFF for (_h, _m, _w, _l) in posted)
+
+    def test_type_text_filters_non_ascii(self, monkeypatch):
+        monkeypatch.setattr(di, "is_edit_control", lambda hwnd: False)
+        posted: list[tuple] = []
+        assert di.type_text("a中b😀", hwnd=1, delay_ms=1,
+                            post=lambda *a: posted.append(a) or True,
+                            sleep=lambda _s: None) == 2
+        assert [chr(w) for (_h, m, w, _l) in posted if m == di.WM_CHAR] == ["a", "b"]
+
+    def test_no_focus_window_returns_zero(self, monkeypatch):
+        monkeypatch.setattr(di, "focus_window", lambda: 0)
+        assert di.type_text("ab", delay_ms=1) == 0
+
+    def test_refuses_when_target_rejects_messages(self, monkeypatch):
+        """UIPI / 目标拒收消息：一个字都别往里发，返回 0 让上层报警。"""
+        monkeypatch.setattr(di, "focus_window", lambda: 4321)
+        monkeypatch.setattr(di, "can_post", lambda hwnd: (False, di.ERROR_ACCESS_DENIED))
+        posted: list[tuple] = []
+        assert di.type_text("ab", delay_ms=1,
+                            post=None) == 0
+        assert posted == []
+
+    def test_edit_control_gets_whole_text_at_once(self, monkeypatch):
+        """标准 Edit：WM_SETTEXT 一次写完（追加，不覆盖），不再逐字符。"""
+        monkeypatch.setattr(di, "is_edit_control", lambda hwnd: True)
+        store = {"text": "old"}
+        monkeypatch.setattr(di, "read_text", lambda hwnd, **kw: store["text"])
+
+        def fake_set(hwnd, text, **kw):
+            store["text"] = text
+            return True
+
+        monkeypatch.setattr(di, "set_text", fake_set)
+        posted: list[tuple] = []
+        typed = di.type_text("abc", hwnd=7, delay_ms=1,
+                             post=lambda *a: posted.append(a) or True,
+                             sleep=lambda _s: None)
+        assert typed == 3
+        assert store["text"] == "oldabc", "必须是追加语义，不能清掉已有内容"
+        assert posted == [], "写成功了就不该再逐字符发一遍"
+
+    def test_edit_ladder_falls_back_when_content_unchanged(self, monkeypatch):
+        """读回没变化 = 这个「Edit」其实不吃 WM_SETTEXT，要退到逐字符。"""
+        monkeypatch.setattr(di, "is_edit_control", lambda hwnd: True)
+        monkeypatch.setattr(di, "read_text", lambda hwnd, **kw: "old")
+        monkeypatch.setattr(di, "set_text", lambda hwnd, text, **kw: True)
+        posted: list[tuple] = []
+        typed = di.type_text("ab", hwnd=7, delay_ms=1,
+                             post=lambda *a: posted.append(a) or True,
+                             sleep=lambda _s: None)
+        assert typed == 2
+        assert len([1 for (_h, m, _w, _l) in posted if m == di.WM_CHAR]) == 2
+
+    def test_should_stop_halts_message_typing(self, monkeypatch):
+        monkeypatch.setattr(di, "is_edit_control", lambda hwnd: False)
+        posted: list[tuple] = []
+        typed = di.type_text("abcdef", hwnd=1, delay_ms=1,
+                             post=lambda *a: posted.append(a) or True,
+                             sleep=lambda _s: None,
+                             should_stop=lambda: len(posted) >= 2)
+        assert typed == 2
+
+
+def _legacy_dpapi_cipher(text: str) -> str:
+    """造一份**旧格式**（``enc1:``，只用 DPAPI、不带附加熵）的密文。
+
+    只为测兼容：老配置里的密文长这样，升级逻辑必须读得懂。
+    """
+    import base64
+    import ctypes
+    import ctypes.wintypes as wt
+
+    class _BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    raw = text.encode("utf-8")
+    buf = ctypes.create_string_buffer(raw, len(raw))
+    blob_in = _BLOB(len(raw), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _BLOB()
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_BLOB), wt.LPCWSTR, ctypes.POINTER(_BLOB),
+        ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_BLOB)]
+    crypt32.CryptProtectData.restype = wt.BOOL
+    if not crypt32.CryptProtectData(
+            ctypes.byref(blob_in), "MacroSmith", None, None, None, 0x1,
+            ctypes.byref(blob_out)):
+        raise RuntimeError("CryptProtectData 失败")
+    data = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return "enc1:" + base64.b64encode(data).decode("ascii")
+
+
+class TestQuickInputCrypto:
+    """密码本地加密（DPAPI）与降级。"""
+
+    def test_roundtrip_ascii(self):
+        enc = qi.protect("P@ssw0rd!")
+        assert qi.is_protected(enc)
+        assert qi.unprotect(enc) == "P@ssw0rd!"
+
+    def test_roundtrip_non_ascii(self):
+        """存的是密码原文（可能含中文），加密层不能只认 ASCII。"""
+        enc = qi.protect("密码abc123")
+        assert qi.unprotect(enc) == "密码abc123"
+
+    def test_empty_stays_empty(self):
+        assert qi.protect("") == ""
+        assert qi.unprotect("") == ""
+
+    def test_ciphertext_hides_plaintext(self):
+        """落盘内容里不能出现明文片段——这是整个加密的意义。"""
+        enc = qi.protect("SuperSecret123")
+        assert "SuperSecret123" not in enc
+        assert enc.startswith(qi.PROTECT_PREFIX)
+
+    def test_plaintext_passthrough(self):
+        """没有前缀就当明文（兼容手工编辑与加密不可用的降级场景）。"""
+        assert not qi.is_protected("plain")
+        assert qi.unprotect("plain") == "plain"
+
+    def test_broken_cipher_returns_empty(self):
+        """解不开时返回空串：把密文当密码敲出去只会更糟。"""
+        assert qi.unprotect(qi.PROTECT_PREFIX + "不是base64") == ""
+
+    def test_same_plaintext_different_cipher(self):
+        """DPAPI 每次加密带随机盐，两次结果不该相同（可看出没被固定密钥硬编码）。"""
+        assert qi.protect("abc") != qi.protect("abc")
+
+    def test_cipher_has_entropy_prefix(self):
+        """当前格式是 ``enc2:``（带附加熵），不是旧的 ``enc1:``。
+
+        这条测试锁的是**产品要求**：config.json 里的密文，只有宏匠能解开，
+        别的程序（哪怕以同一个 Windows 用户运行）读到也解不出明文。
+        ``enc1`` 只按用户加密，任何同用户进程都能解开，所以不能再产。
+        """
+        assert qi.PROTECT_PREFIX == "enc2:"
+        assert qi.LEGACY_PROTECT_PREFIX == "enc1:"
+        assert qi.protect("x").startswith("enc2:")
+
+    def test_third_party_without_entropy_cannot_decrypt(self):
+        """模拟「第三方工具」：拿到密文、也知道用户上下文，但没有附加熵。
+
+        直接调 ``CryptUnprotectData``（不带 pOptionalEntropy）必须失败——
+        这正是「只有宏匠读得出来」的技术含义。
+        """
+        import base64
+        import ctypes
+        import ctypes.wintypes as wt
+
+        from core.quick_input import IS_WINDOWS
+
+        if not IS_WINDOWS:  # pragma: no cover - 非 Windows 无 DPAPI
+            pytest.skip("仅 Windows 有 DPAPI")
+
+        enc = qi.protect("ThirdPartyCannotRead")
+        data = base64.b64decode(enc.split(":", 1)[1])
+
+        class _BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        buf = ctypes.create_string_buffer(data, len(data))
+        blob_in = _BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _BLOB()
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        crypt32.CryptUnprotectData.argtypes = [
+            ctypes.POINTER(_BLOB), ctypes.POINTER(wt.LPWSTR), ctypes.POINTER(_BLOB),
+            ctypes.c_void_p, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(_BLOB)]
+        crypt32.CryptUnprotectData.restype = wt.BOOL
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0x1,
+            ctypes.byref(blob_out))
+        assert not ok, "不带附加熵竟然解开了 —— 加密等于没做"
+
+    def test_legacy_cipher_still_readable(self):
+        """旧密文（``enc1:``，无附加熵）必须还能读：老用户升级后密码不能凭空消失。"""
+        from core.quick_input import IS_WINDOWS
+
+        if not IS_WINDOWS:  # pragma: no cover
+            pytest.skip("仅 Windows 有 DPAPI")
+
+        legacy = _legacy_dpapi_cipher("LegacyPass1")
+        assert qi.is_protected(legacy)
+        assert qi.needs_upgrade(legacy)
+        assert qi.unprotect(legacy) == "LegacyPass1"
+
+
+class TestQuickInputConfig:
+    """配置项：默认关闭、热键按需注册、密码加密落盘。"""
+
+    @pytest.fixture()
+    def cfg(self, tmp_path):
+        """用临时配置文件。
+
+        不能读本机真实 ``config.json``：用户只要自己开一次「快捷输入」并存过
+        密码，这里立刻变红——那测的是用户配置，不是默认值。
+        """
+        return Config(tmp_path / "config.json")
+
+    def test_default_disabled(self, cfg):
+        """默认关闭：F1/F2/F3 在多数软件里另有用途，不能开箱就抢。"""
+        assert cfg.quick_input_enabled is False
+        assert cfg.quick_paste_enabled is True
+        assert cfg.quick_delay_ms == 8
+
+    def test_hotkey_defaults(self, cfg):
+        assert cfg.hotkey("quick_paste") == "f1"
+        assert [cfg.hotkey(f"quick_pwd_{i}") for i in (1, 2, 3)] == ["f2", "f3", "f4"]
+        for action in QUICK_HOTKEY_ACTIONS:
+            assert action in DEFAULT_HOTKEYS
+
+    def test_method_defaults_to_auto(self, cfg):
+        """默认必须是 auto：钉死某条通道等于关掉整条降级阶梯。
+
+        2026-11-11 实测踩过：``mode`` 被写成 ``unicode`` 时，探针与降级全部
+        跳过，状态栏报「已敲入 N 个字符」，受保护窗口里却一个字都没有。
+        """
+        assert cfg.quick_method == "auto"
+
+    def test_method_persists_and_validates(self, cfg, tmp_path):
+        cfg.set("quick_input.mode", "physical")
+        cfg.save()
+        assert Config(tmp_path / "config.json").quick_method == "physical"
+        # 手工改坏的值在加载时被折回 auto，不让打字哑掉
+        cfg.set("quick_input.mode", "乱写")
+        cfg.save()
+        assert Config(tmp_path / "config.json").quick_method == "auto"
+
+    def test_click_first_defaults_on_and_persists(self, cfg, tmp_path):
+        """「敲字前先点一下左键」默认开。
+
+        QQ / 腾讯微云 / WeGame 的登录框是页面内输入框，只有收到真实鼠标按下
+        才把键盘焦点交给那个框；不点就把按键丢掉（2026-11-12 用户实测，
+        参考工具也是「先点一下再敲」）。
+        """
+        assert cfg.quick_click_first is True
+        cfg.set("quick_input.click_first", False)
+        cfg.save()
+        assert Config(tmp_path / "config.json").quick_click_first is False
+
+    def test_quick_actions_not_in_global_labels(self):
+        """快捷输入有自己的设置区域，不能混进「全局热键」列表。"""
+        for action in QUICK_HOTKEY_ACTIONS:
+            assert action not in HOTKEY_LABELS
+
+    def test_bindings_empty_when_disabled(self, cfg):
+        """关着就一条都不注册，否则独占钩子会白白吞掉 F1–F4。"""
+        cfg.set_quick_password("pwd_1", "abc")
+        assert cfg.quick_hotkey_bindings() == {}
+
+    def test_bindings_only_for_filled_slots(self, cfg):
+        cfg.set("quick_input.enabled", True)
+        assert cfg.quick_hotkey_bindings() == {"quick_paste": "f1"}
+        cfg.set_quick_password("pwd_2", "xyz")
+        assert cfg.quick_hotkey_bindings() == {
+            "quick_paste": "f1", "quick_pwd_2": "f3"}
+
+    def test_paste_switch_respected(self, cfg):
+        cfg.set("quick_input.enabled", True)
+        cfg.set("quick_input.paste_enabled", False)
+        assert "quick_paste" not in cfg.quick_hotkey_bindings()
+
+    def test_password_saved_encrypted(self, tmp_path):
+        path = tmp_path / "c.json"
+        cfg = Config(path)
+        cfg.set("quick_input.enabled", True)
+        cfg.set_quick_password("pwd_1", "MyPass123")
+        cfg.save()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        stored = raw["quick_input"]["pwd_1"]
+        assert stored.startswith(qi.PROTECT_PREFIX)
+        assert "MyPass123" not in stored
+        # 重新加载仍能解出原文
+        assert Config(path).quick_password("pwd_1") == "MyPass123"
+
+    def test_delay_is_clamped_in_sanitize(self, tmp_path):
+        path = tmp_path / "c.json"
+        path.write_text(json.dumps({"quick_input": {"delay_ms": 99999}}), encoding="utf-8")
+        assert Config(path).quick_delay_ms == qi.MAX_DELAY_MS
+        path.write_text(json.dumps({"quick_input": {"delay_ms": "x"}}), encoding="utf-8")
+        assert Config(path).quick_delay_ms == qi.DEFAULT_DELAY_MS
+
+    def test_legacy_config_gets_defaults(self, tmp_path):
+        """老配置文件没有 quick_input 段，深合并要自动补齐。"""
+        path = tmp_path / "c.json"
+        path.write_text(json.dumps({"hotkeys": {"record_stop": "f9"}}), encoding="utf-8")
+        cfg = Config(path)
+        assert cfg.quick_input_enabled is False
+        assert cfg.get("quick_input.delay_ms") == 8
+        for slot in QUICK_PASSWORD_SLOTS:
+            assert cfg.get(f"quick_input.{slot}") == ""
+
+    def test_quick_hotkeys_are_parseable(self):
+        """改键后的 token 必须能被 HotkeyManager 解析，否则注册会静默失败。"""
+        from core.hotkey_manager import probe_hotkey
+
+        for token in ("f1", "f2", "f3", "f4"):
+            assert probe_hotkey(token)
+
+    def test_upgrade_legacy_cipher(self, tmp_path):
+        """旧的 ``enc1:`` 密文读到就升级成 ``enc2:``，且明文一字不差。
+
+        「同一用户下任何程序都能解开」的旧格式必须淘汰，但用户存过的密码
+        不能因此丢失——先按旧格式读出来，再按新格式写回去。
+        """
+        from core.quick_input import IS_WINDOWS, needs_upgrade
+
+        if not IS_WINDOWS:  # pragma: no cover - 非 Windows 无 DPAPI
+            pytest.skip("仅 Windows 有 DPAPI")
+
+        path = tmp_path / "c.json"
+        legacy = _legacy_dpapi_cipher("OldPass888")
+        path.write_text(json.dumps(
+            {"quick_input": {"pwd_2": legacy}}), encoding="utf-8")
+
+        cfg = Config(path)
+        assert qi.unprotect(cfg.get("quick_input.pwd_2")) == "OldPass888"
+        assert cfg.upgrade_quick_passwords() == 1
+        cfg.save()
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["quick_input"]["pwd_2"].startswith("enc2:")
+        assert not needs_upgrade(raw["quick_input"]["pwd_2"])
+        # 升级之后仍然读得出原文
+        assert Config(path).quick_password("pwd_2") == "OldPass888"
+        # 再跑一次是空操作（幂等）
+        assert Config(path).upgrade_quick_passwords() == 0
+
+
+class TestQuickInputSendKey:
+    """win_input.send_key：键盘注入的底层调用。"""
+
+    def test_click_left_sends_down_then_up(self, monkeypatch):
+        """补点击：先 LEFTDOWN 再 LEFTUP，不移动指针，且带本程序标记。
+
+        页面内输入框（QQ / 腾讯微云 / WeGame 登录框）只认真实鼠标按下，
+        所以这两条事件的顺序和标记都不能错。
+        """
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        assert win_input.click_left(hold_ms=0) is True
+        assert [i.mi.dwFlags for i in seen] == [win_input.MOUSEEVENTF_LEFTDOWN,
+                                                win_input.MOUSEEVENTF_LEFTUP]
+        assert all(i.type == win_input.INPUT_MOUSE for i in seen)
+        assert all((i.mi.dx, i.mi.dy) == (0, 0) for i in seen), "不许挪指针"
+        assert all(i.mi.dwExtraInfo == win_input.INJECT_TAG for i in seen)
+
+    def test_click_left_failure_returns_false(self, monkeypatch):
+        monkeypatch.setattr(win_input, "_call_send_input", lambda inp: 0)
+        assert win_input.click_left(hold_ms=0) is False
+
+    def test_send_key_calls_send_input(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        assert win_input.send_key(0x41) is True
+        assert seen[0].type == win_input.INPUT_KEYBOARD
+        assert seen[0].ki.wVk == 0x41
+        assert seen[0].ki.dwFlags == 0
+
+    def test_send_key_up_sets_flag(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        win_input.send_key(0x41, up=True)
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_KEYUP
+
+    def test_send_key_failure_returns_false(self, monkeypatch):
+        monkeypatch.setattr(win_input, "_call_send_input", lambda inp: 0)
+        monkeypatch.setattr(win_input, "_warn_once", lambda *a, **k: None)
+        assert win_input.send_key(0x41) is False
+
+    def test_send_char_uses_unicode_flag(self, monkeypatch):
+        """字符通道：wVk 留 0、字符进 wScan、带 KEYEVENTF_UNICODE。
+
+        这三条正是它躲开输入法/键盘布局/CapsLock 的原因，缺一条就会被
+        中文输入法拼成别的字。
+        """
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        assert win_input.send_char("A") is True
+        assert seen[0].type == win_input.INPUT_KEYBOARD
+        assert seen[0].ki.wVk == 0
+        assert seen[0].ki.wScan == ord("A")
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_UNICODE
+        assert not seen[0].ki.dwFlags & win_input.KEYEVENTF_KEYUP
+
+    def test_send_char_up_sets_both_flags(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        win_input.send_char("中", up=True)
+        assert seen[0].ki.wScan == ord("中")
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_UNICODE
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_KEYUP
+
+    def test_send_char_rejects_non_single_char(self, monkeypatch):
+        """多字符/空串直接拒掉：一次 SendInput 只能表达一个字符。"""
+        monkeypatch.setattr(win_input, "_call_send_input", lambda inp: 1)
+        assert win_input.send_char("ab") is False
+        assert win_input.send_char("") is False
+
+    # ---- 物理按键通道（wVk + wScan 都填）----
+    def test_send_physical_key_fills_both_fields(self, monkeypatch):
+        """最像真键盘的一条：键码与扫描码必须同时填准，且不带标志位。
+
+        目标程序若在应用层校验「键码与扫描码是否匹配」，``unicode``
+        （wVk=0）和 ``simulate``（wScan=0 的 vk）都会被判成假按键，
+        只有这条能过——所以两个字段一个都不能省。
+        """
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        assert win_input.send_physical_key(0x41) is True      # 'A'
+        assert seen[0].ki.wVk == 0x41
+        assert seen[0].ki.wScan == 0x1E, "扫描码必须按 MapVirtualKey 填"
+        assert seen[0].ki.dwFlags == 0, "不能带 UNICODE / SCANCODE 标志"
+
+    def test_send_physical_key_up_sets_keyup_only(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        win_input.send_physical_key(0x41, up=True)
+        assert seen[0].ki.dwFlags == win_input.KEYEVENTF_KEYUP
+
+    # ---- 扫描码通道（KEYEVENTF_SCANCODE）----
+    def test_send_key_scancode_uses_scan_not_vk(self, monkeypatch):
+        """扫描码通道：wVk 必须留 0，键位只写在 wScan 里。
+
+        写回 wVk 就成了字符通道的孪生兄弟，等于没换通道——两条通道的
+        区别正是「只给扫描码 vs 只给字符」。
+        """
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        assert win_input.send_key_scancode(0x41) is True     # 'A' -> 0x1E
+        assert seen[0].ki.wVk == 0
+        assert seen[0].ki.wScan == 0x1E
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_SCANCODE
+        assert not seen[0].ki.dwFlags & win_input.KEYEVENTF_KEYUP
+
+    def test_send_key_scancode_up_sets_both_flags(self, monkeypatch):
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        win_input.send_key_scancode(0x41, up=True)
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_SCANCODE
+        assert seen[0].ki.dwFlags & win_input.KEYEVENTF_KEYUP
+
+    def test_send_key_scancode_without_scan_code_returns_false(self, monkeypatch):
+        """没有物理键的键码（如某些虚拟键）不去骗调用方：直接 False。"""
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        monkeypatch.setattr(win_input, "_vk_to_scan", lambda vk: 0)
+        assert win_input.send_key_scancode(0x41) is False
+        assert seen == [], "取不到扫描码就不该发事件"
+
+    def test_injection_probe_uses_requested_channel(self, monkeypatch):
+        """``scancode=True`` 的探针必须走扫描码通道，否则两条路分不出真假。"""
+        sent: list[tuple] = []
+        monkeypatch.setattr(win_input, "send_key",
+                            lambda vk, up=False: sent.append(("char", vk)) or True)
+        monkeypatch.setattr(win_input, "send_key_scancode",
+                            lambda vk, up=False: sent.append(("scan", vk)) or True)
+        monkeypatch.setattr(win_input, "time", type("T", (), {"sleep": staticmethod(lambda _s: None)}))
+        win_input.injection_delivered(scancode=True)
+        assert sent and all(kind == "scan" for kind, _vk in sent)
+        sent.clear()
+        win_input.injection_delivered()
+        assert sent and all(kind == "char" for kind, _vk in sent)
+
+    def test_probe_accepts_tick_when_key_state_is_ignored(self, monkeypatch):
+        """探针键被目标忽略、但输入时间戳在动 → 仍算「事件进了系统」。
+
+        2026-11-12：QQ / 腾讯微云 / WeGame 上探针键（当时的 F24）被驱动专门
+        过滤，两条通道都报「被丢弃」，自动模式于是直接跳窗口消息、一个字符都
+        没走注入。加上时间戳判据后这种情况能被正确识别成「通」。
+        """
+        ticks = iter([100, 100, 110, 120])
+        monkeypatch.setattr(win_input, "last_input_tick", lambda: next(ticks))
+        monkeypatch.setattr(win_input, "send_key", lambda vk, up=False: True)
+        monkeypatch.setattr(win_input.ctypes.windll.user32, "GetAsyncKeyState",
+                            lambda vk: 0, raising=False)
+        monkeypatch.setattr(win_input, "time",
+                            type("T", (), {"sleep": staticmethod(lambda _s: None)}))
+        assert win_input.injection_delivered() is True
+
+    def test_probe_reports_blocked_when_neither_signal_moves(self, monkeypatch):
+        monkeypatch.setattr(win_input, "last_input_tick", lambda: 100)
+        monkeypatch.setattr(win_input, "send_key", lambda vk, up=False: True)
+        monkeypatch.setattr(win_input.ctypes.windll.user32, "GetAsyncKeyState",
+                            lambda vk: 0, raising=False)
+        monkeypatch.setattr(win_input, "time",
+                            type("T", (), {"sleep": staticmethod(lambda _s: None)}))
+        assert win_input.injection_delivered() is False
+
+    def test_probe_key_is_not_f24(self):
+        """探针键不能再是 F24：它是自动化工具的招牌，会被驱动针对性过滤。"""
+        assert win_input._PROBE_VK != 0x87

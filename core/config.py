@@ -48,7 +48,21 @@ DEFAULT_HOTKEYS: dict[str, str] = {
     "step_next": "page_down",  # 模式二：下一步
     "step_prev": "page_up",    # 模式二：上一步
     "step_reset": "home",      # 模式二：重置指针
+    # 快捷输入（文本模拟打字）：F1 敲剪贴板内容，F2/F3/F4 敲三个密码
+    "quick_paste": "f1",
+    "quick_pwd_1": "f2",
+    "quick_pwd_2": "f3",
+    "quick_pwd_3": "f4",
 }
+
+#: 「快捷输入」专用的热键动作。它们有自己的设置区域（含密码框），
+#: 因此不进 :data:`HOTKEY_LABELS`——否则会混进「全局热键」列表里多出四行。
+QUICK_HOTKEY_ACTIONS: tuple[str, ...] = (
+    "quick_paste", "quick_pwd_1", "quick_pwd_2", "quick_pwd_3",
+)
+
+#: 快捷输入三个密码槽位（与 quick_pwd_1..3 一一对应）
+QUICK_PASSWORD_SLOTS: tuple[str, ...] = ("pwd_1", "pwd_2", "pwd_3")
 
 #: 热键的界面显示名与说明
 HOTKEY_LABELS: dict[str, tuple[str, str]] = {
@@ -61,6 +75,14 @@ HOTKEY_LABELS: dict[str, tuple[str, str]] = {
     "step_next": ("下一步（模式二）", "模式二：执行下一个操作单元"),
     "step_prev": ("上一步（模式二）", "模式二：回退到上一个操作单元"),
     "step_reset": ("重置指针（模式二）", "模式二：把步骤指针复位到开头"),
+}
+
+#: 快捷输入热键的界面显示名（注册失败的提示要用）
+QUICK_HOTKEY_LABELS: dict[str, str] = {
+    "quick_paste": "F1 敲入剪贴板",
+    "quick_pwd_1": "快捷密码 1",
+    "quick_pwd_2": "快捷密码 2",
+    "quick_pwd_3": "快捷密码 3",
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -88,6 +110,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
     #: 状态提示音：开始/暂停/继续/结束 录制与回放各响一声（见 core/sound.py）
     #: ``step_enabled`` 是模式二「上一步 / 下一步」的独立开关（连按时可能嫌吵）
     "sound": {"enabled": True, "step_enabled": True},
+    #: 快捷输入（文本模拟打字）：按热键把文本逐字符敲进当前焦点窗口
+    #: ``enabled`` 默认**关闭**：F1/F2/F3 在多数软件里本来有用途（帮助/重命名/
+    #: 查找），独占钩子一旦吞掉它们，用户会以为键盘坏了。要用手动打开。
+    #: ``pwd_1..3`` 存的是 ``core.quick_input.protect()`` 的产物（DPAPI 密文），
+    #: 没有 ``enc1:`` 前缀就按明文处理（兼容手工编辑与降级场景）。
+    "quick_input": {
+        "enabled": False,
+        "paste_enabled": True,
+        "delay_ms": 8,
+        #: 注入通道：``auto``（默认，按 物理按键 → 仅扫描码 → 窗口消息 降级）/
+        #: ``unicode`` / ``message`` / ``vk``。平时 auto 就够了。
+        "mode": "auto",
+        #: 敲字前先在**当前指针位置**补一次左键单击。页面内输入框
+        #: （QQ / 腾讯微云 / WeGame 的登录框都是 CEF/Electron 自绘）只有收到
+        #: 真实鼠标按下才把键盘焦点交给页面里的 input，不发点击它们就把按键
+        #: 丢掉。代价是**指针必须放在要输入的框上**（参考工具也是这个规矩）。
+        "click_first": True,
+        "pwd_1": "",
+        "pwd_2": "",
+        "pwd_3": "",
+    },
     "scripts_dir": "data/scripts",
     "last_script": None,
 }
@@ -240,6 +283,103 @@ class Config:
             self.set("merge.multi_click", bool(multi_click))
 
     # ------------------------------------------------------------------
+    # 快捷输入（文本模拟打字）
+    # ------------------------------------------------------------------
+    @property
+    def quick_input_enabled(self) -> bool:
+        """总开关。默认关闭——F1/F2/F3 在多数软件里本来有别的用途。"""
+        return bool(self.get("quick_input.enabled", False))
+
+    @property
+    def quick_paste_enabled(self) -> bool:
+        """F1「敲入剪贴板内容」的独立开关。"""
+        return bool(self.get("quick_input.paste_enabled", True))
+
+    @property
+    def quick_delay_ms(self) -> int:
+        """字符之间的敲击间隔（毫秒，已夹紧到合法范围）。"""
+        from core.quick_input import clamp_delay
+
+        return clamp_delay(self.get("quick_input.delay_ms", 8))
+
+    @property
+    def quick_method(self) -> str:
+        """注入通道：``auto``（默认）/ ``unicode`` / ``simulate`` / ``message`` / ``vk``。"""
+        from core.quick_input import normalize_method
+
+        return normalize_method(self.get("quick_input.mode", "auto"))
+
+    @property
+    def quick_click_first(self) -> bool:
+        """敲字前是否先在当前指针位置补一次左键单击（默认开）。
+
+        页面内输入框（QQ / 腾讯微云 / WeGame 的登录框）只有收到真实鼠标按下
+        才把键盘焦点交给页面，不发点击按键会被丢掉。
+        """
+        return bool(self.get("quick_input.click_first", True))
+
+    def quick_password(self, slot: str) -> str:
+        """读出某个密码槽的**明文**（自动解密）。"""
+        from core.quick_input import unprotect
+
+        return unprotect(self.get(f"quick_input.{slot}", ""))
+
+    def set_quick_password(self, slot: str, text: str) -> None:
+        """写入某个密码槽（自动加密后落盘）。"""
+        from core.quick_input import protect
+
+        self.set(f"quick_input.{slot}", protect(text))
+
+    def upgrade_quick_passwords(self) -> int:
+        """把旧密文（``enc1:``，无附加熵）重新加密成 ``enc2:``。
+
+        为什么需要这一步：``enc1:`` 只用了 DPAPI 的「当前用户」密钥，**同一
+        Windows 用户下任何程序都能解开**——那正是用户不希望发生的事。新格式
+        带附加熵（见 :data:`core.quick_input._SECRET_ENTROPY`），拿不到那串
+        字节就解不开。老配置不能丢，所以先按旧格式读懂、再按新格式重写。
+
+        返回升级的条数（调用方决定要不要立刻 ``save()``）。
+        """
+        from core.quick_input import needs_upgrade, protect, unprotect
+
+        upgraded = 0
+        for slot in QUICK_PASSWORD_SLOTS:
+            raw = self.get(f"quick_input.{slot}", "")
+            if not needs_upgrade(raw):
+                continue
+            plain = unprotect(raw)
+            if not plain:
+                # 解密失败的就不动它：重写成空会把用户的密码彻底弄丢
+                log.warning("密码槽 %s 的旧密文解不开，保持原样", slot)
+                continue
+            self.set(f"quick_input.{slot}", protect(plain))
+            upgraded += 1
+        if upgraded:
+            log.info("已把 %d 个密码槽升级为带附加熵的加密格式（enc2）", upgraded)
+        return upgraded
+
+    def quick_hotkey_bindings(self) -> dict[str, str]:
+        """当前**应当注册**的快捷输入热键。
+
+        只返回真正可用的那几条：
+        * 总开关关闭 → 一条都不注册（否则独占钩子会白白吞掉 F1–F4）；
+        * 「敲剪贴板」关掉 → 不注册 ``quick_paste``；
+        * 某个密码为空 → 不注册对应热键（按下只会打出空气，还不如让它透传）。
+
+        用户改键后的 token 从 ``hotkeys`` 段读，所以这里返回的可以直接并进
+        :meth:`Config.hotkeys` 交给 ``HotkeyManager.register_all``。
+        """
+        if not self.quick_input_enabled:
+            return {}
+        out: dict[str, str] = {}
+        if self.quick_paste_enabled:
+            out["quick_paste"] = self.hotkey("quick_paste")
+        for index, slot in enumerate(QUICK_PASSWORD_SLOTS, start=1):
+            if str(self.get(f"quick_input.{slot}", "") or "").strip():
+                out[f"quick_pwd_{index}"] = self.hotkey(f"quick_pwd_{index}")
+        return out
+
+    # ------------------------------------------------------------------
     # 循环回放（只作用于模式一）
     # ------------------------------------------------------------------
     @property
@@ -346,6 +486,19 @@ class Config:
                 player[key] = type(default)(player.get(key, default))
             except (TypeError, ValueError):
                 player[key] = default
+
+        quick = self.data.setdefault("quick_input", {})
+        for key, default in (("enabled", False), ("paste_enabled", True),
+                             ("click_first", True)):
+            quick[key] = bool(default if quick.get(key) is None else quick[key])
+        from core.quick_input import clamp_delay, normalize_method
+
+        quick["delay_ms"] = clamp_delay(quick.get("delay_ms", 8))
+        # 通道只允许白名单取值，写错（手工编辑）时回落到默认，别让打字直接哑掉
+        quick["mode"] = normalize_method(quick.get("mode", "auto"))
+        # 密码槽统一成字符串：手工编辑成数字/对象时也不该让程序崩在打字前
+        for slot in QUICK_PASSWORD_SLOTS:
+            quick[slot] = str(quick.get(slot) or "")
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

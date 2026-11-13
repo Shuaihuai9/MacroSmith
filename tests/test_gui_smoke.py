@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ from PySide6.QtTest import QTest                                  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox  # noqa: E402
 
 from core import event_parser as ep                              # noqa: E402
+from core import quick_input as qi                               # noqa: E402
 from core.config import DEFAULT_HOTKEYS, Config                   # noqa: E402
 from core.hotkey_hook import hook_supported                       # noqa: E402
 from core.player import MODE_STEP, MODE_TIMED                    # noqa: E402
@@ -4305,3 +4307,368 @@ class TestHandoffBetweenReplayAndStep:
         # 暂停点之后的那一步必须已经执行过（指针前进了，且没回到 0）
         assert window.player.step_index > 0, "暂停后单步不能从第一步重来"
         assert window.player.step_index >= paused_position // 2
+
+
+# ===========================================================================
+# 快捷输入（文本模拟打字）
+# ===========================================================================
+class TestQuickInputSettings:
+    """设置页「快捷输入」区域：控件、开关联动、保存落盘。"""
+
+    def test_widgets_exist(self, window, qapp):
+        page = window.page_quick
+        assert page.chk_enabled.isChecked() is False   # 默认关闭
+        assert page.chk_paste.isChecked() is True
+        assert len(page._pwd_edits) == 3
+        assert len(page._eye_buttons) == 3
+        for index in (1, 2, 3):
+            assert f"quick_pwd_{index}" in page._edits
+        assert page.btn_save.isEnabled() is True, (
+            "保存按钮必须一直可用：否则取消勾选后没法把「关闭」存下去")
+
+    def test_password_fields_masked(self, window, qapp):
+        from PySide6.QtWidgets import QLineEdit
+
+        for edit in window.page_quick._pwd_edits.values():
+            assert edit.echoMode() == QLineEdit.Password
+
+    def test_method_combo_defaults_to_auto(self, window, qapp):
+        """通道下拉默认「自动」。
+
+        钉死某条通道等于关掉整条降级阶梯——2026-11-11 就是配置里写着
+        ``unicode``，受保护窗口一个字符都没进去，状态栏却报「已敲入 N 个字符」。
+        """
+        page = window.page_quick
+        assert page.combo_method.currentData() == "auto"
+        # 下拉里必须能选到「物理按键」与「窗口消息」，否则用户没法手工换通道
+        values = [page.combo_method.itemData(i)
+                  for i in range(page.combo_method.count())]
+        assert "physical" in values and "message" in values
+        assert page.combo_method.isEnabled() is False   # 总开关默认关
+
+    def test_save_persists_method(self, window, qapp):
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        _pump(qapp, 10)
+        index = page.combo_method.findData("physical")
+        page.combo_method.setCurrentIndex(index)
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert window.config.quick_method == "physical"
+        # 重新载入也要回到这一项，不能悄悄回落
+        page.load_from_config(window.config)
+        assert page.combo_method.currentData() == "physical"
+
+    def test_click_first_checkbox_defaults_on(self, window, qapp):
+        """「敲字前先点一下左键」默认勾上：页面内输入框不点就收不到字。"""
+        page = window.page_quick
+        assert page.chk_click.isChecked() is True
+        assert page.chk_click.isEnabled() is False   # 总开关默认关
+
+    def test_save_persists_click_first(self, window, qapp):
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        _pump(qapp, 10)
+        page.chk_click.setChecked(False)
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert window.config.quick_click_first is False
+        page.load_from_config(window.config)
+        assert page.chk_click.isChecked() is False
+
+    def test_eye_button_toggles_plaintext(self, window, qapp):
+        from PySide6.QtWidgets import QLineEdit
+
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        _pump(qapp, 10)
+        edit = page._pwd_edits["pwd_1"]
+        eye = page._eye_buttons["pwd_1"]
+        assert edit.echoMode() == QLineEdit.Password
+        assert eye.text() == "显示"
+
+        eye.setChecked(True)
+        _pump(qapp, 10)
+        assert edit.echoMode() == QLineEdit.Normal
+        assert eye.text() == "隐藏"
+
+        eye.setChecked(False)
+        _pump(qapp, 10)
+        assert edit.echoMode() == QLineEdit.Password
+
+    def test_master_switch_greys_children(self, window, qapp):
+        page = window.page_quick
+        assert page.spin_delay.isEnabled() is False
+        assert page.chk_paste.isEnabled() is False
+        page.chk_enabled.setChecked(True)
+        _pump(qapp, 10)
+        assert page.spin_delay.isEnabled() is True
+        assert page.chk_paste.isEnabled() is True
+        assert page.btn_save.isEnabled() is True
+        assert page._edits["quick_pwd_1"].isEnabled() is True
+
+    def test_save_writes_config_and_encrypts(self, window, qapp, tmp_path):
+        """保存后：开关落盘、密码是密文、热键注册到位。"""
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        page._pwd_edits["pwd_1"].setText("Pass123")
+        page.btn_save.click()
+        _pump(qapp, 60)
+
+        cfg = window.config
+        assert cfg.quick_input_enabled is True
+        assert cfg.quick_password("pwd_1") == "Pass123"
+        raw = json.loads(cfg.path.read_text(encoding="utf-8"))
+        assert raw["quick_input"]["pwd_1"].startswith("enc2:")
+        assert "Pass123" not in raw["quick_input"]["pwd_1"]
+        # F1 + F2 都该注册上（只填了 pwd_1，F3/F4 不占键）
+        bindings = window._hotkey_bindings()
+        assert bindings.get("quick_paste") == "f1"
+        assert bindings.get("quick_pwd_1") == "f2"
+        assert "quick_pwd_2" not in bindings
+        assert "快捷输入已保存" in window.message_label.text()
+
+    def test_save_off_releases_hotkeys(self, window, qapp):
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        page._pwd_edits["pwd_1"].setText("Pass123")
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert "quick_paste" in window._hotkey_bindings()
+
+        page.chk_enabled.setChecked(False)
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert window.config.quick_input_enabled is False
+        assert not [a for a in window._hotkey_bindings()
+                    if a.startswith("quick_")], "关闭后必须释放 F1–F4"
+        assert "已关闭" in window.message_label.text()
+
+    def test_settings_save_does_not_touch_quick_input(self, window, qapp):
+        """两页各存各的：设置页的「保存设置」不再顺手写快捷输入。
+
+        拆页前是「保存设置」把快捷输入一起存（怕用户改完密码点错按钮）；
+        现在密码只属于快捷输入页，用设置页的按钮去写它反而会让「改了没生效」
+        变得更难判断——两边各有一个明确的保存按钮才是对的。
+        """
+        page = window.page_quick
+        page._pwd_edits["pwd_1"].setText("OnlyInQuickPage")
+        window.page_settings._on_save()
+        _pump(qapp, 60)
+        assert window.config.quick_password("pwd_1") == ""
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert window.config.quick_password("pwd_1") == "OnlyInQuickPage"
+
+    def test_config_loads_into_page(self, window, qapp):
+        window.config.set("quick_input.enabled", True)
+        window.config.set_quick_password("pwd_2", "loaded")
+        window.config.save()
+        window.page_quick.load_from_config(window.config)
+        _pump(qapp, 10)
+        page = window.page_quick
+        assert page.chk_enabled.isChecked() is True
+        assert page._pwd_edits["pwd_2"].text() == "loaded"
+        assert page._pwd_edits["pwd_1"].text() == ""
+
+    def test_duplicate_hotkey_rejected(self, window, qapp):
+        """把密码热键改成 F6（= 开始回放）必须被拦下，否则两个动作抢一个键。"""
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        page._pwd_edits["pwd_1"].setText("x")
+        page._edits["quick_pwd_1"].set_token("f6")
+        page.btn_save.click()
+        _pump(qapp, 60)
+        # 校验失败：热键没被写进配置，仍是默认的 F2
+        assert window.config.hotkey("quick_pwd_1") == "f2"
+
+
+class TestQuickInputDispatch:
+    """热键动作分发：该敲什么、什么时候不敲。"""
+
+    @staticmethod
+    def _spy_typing(monkeypatch) -> list[tuple[str, int]]:
+        """替身：记录 (文本, 间隔)，不碰真实键盘。"""
+        calls: list[tuple[str, int]] = []
+
+        def fake_type(text, *, delay_ms=8, method="auto", sender=None,
+                      sleep=None, should_stop=None, report=None):
+            calls.append((text, delay_ms))
+            if report is not None:
+                report("unicode")
+            return len(qi.sanitize(text))
+
+        monkeypatch.setattr("core.quick_input.type_text", fake_type)
+        return calls
+
+    def _enable(self, window, qapp, passwords: dict[str, str] | None = None):
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        for slot, text in (passwords or {}).items():
+            page._pwd_edits[slot].setText(text)
+        page.btn_save.click()
+        _pump(qapp, 60)
+
+    def test_clipboard_path(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text",
+                            lambda: "abc123")
+        self._enable(window, qapp)
+
+        window._on_hotkey_action("quick_paste")
+        assert _wait_until(qapp, lambda: calls, 2000)
+        assert calls == [("abc123", 8)]
+        assert _wait_until(qapp, lambda: "已敲入 6 个字符" in window.message_label.text(),
+                           2000)
+
+    def test_clipboard_filters_chinese(self, window, qapp, monkeypatch):
+        """中英混合：只敲 ASCII 部分，并在状态栏说清丢了几个字。"""
+        calls = self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text",
+                            lambda: "abc中文123！")
+        self._enable(window, qapp)
+
+        window._on_hotkey_action("quick_paste")
+        assert _wait_until(qapp, lambda: calls, 2000)
+        assert calls[0][0] == "abc中文123！"          # 交给 type_text 自己过滤
+        assert _wait_until(qapp, lambda: "已敲入 6 个字符" in window.message_label.text(),
+                           2000)
+
+    def test_password_path(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        self._enable(window, qapp, {"pwd_1": "P@ss!"})
+
+        window._on_hotkey_action("quick_pwd_1")
+        assert _wait_until(qapp, lambda: calls, 2000)
+        assert calls == [("P@ss!", 8)]
+
+    def test_empty_password_warns_without_typing(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        self._enable(window, qapp)                     # 三个密码都空
+
+        window._on_hotkey_action("quick_pwd_2")
+        _pump(qapp, 40)
+        assert calls == []
+        assert "还是空的" in window.message_label.text()
+
+    def test_empty_clipboard_warns(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text", lambda: "")
+        self._enable(window, qapp)
+
+        window._on_hotkey_action("quick_paste")
+        _pump(qapp, 40)
+        assert calls == []
+        assert "没有可敲入的文本" in window.message_label.text()
+
+    def test_non_ascii_only_is_refused(self, window, qapp, monkeypatch):
+        """整段都是中文/全角：明确告诉用户敲不出来，而不是默默无事发生。"""
+        calls = self._spy_typing(monkeypatch)
+        self._enable(window, qapp, {"pwd_1": "中文密码！"})
+
+        window._on_hotkey_action("quick_pwd_1")
+        _pump(qapp, 40)
+        assert calls == []
+        assert "没有可模拟输入的字符" in window.message_label.text()
+
+    def test_disabled_master_switch_warns(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        window._on_hotkey_action("quick_paste")
+        _pump(qapp, 40)
+        assert calls == []
+        assert "总开关是关的" in window.message_label.text()
+
+    def test_recording_ignores_quick_input(self, window, qapp, monkeypatch):
+        """录制中一个字符都不许打（否则用户分不清录到了什么）。"""
+        calls = self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text",
+                            lambda: "abc")
+        self._enable(window, qapp)
+        window._set_state(State.RECORDING)
+        _pump(qapp, 20)
+
+        window._on_hotkey_action("quick_paste")
+        _pump(qapp, 40)
+        assert calls == []
+        assert "录制中已忽略快捷输入" in window.message_label.text()
+
+    def test_paused_recording_also_ignored(self, window, qapp, monkeypatch):
+        calls = self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text",
+                            lambda: "abc")
+        self._enable(window, qapp)
+        window._set_state(State.RECORD_PAUSED)
+        _pump(qapp, 20)
+
+        window._on_hotkey_action("quick_paste")
+        _pump(qapp, 40)
+        assert calls == []
+
+    def test_typing_does_not_change_state(self, window, qapp, monkeypatch):
+        """快捷输入不进状态机：敲完仍然是空闲，不能把界面切成录制/回放。"""
+        self._spy_typing(monkeypatch)
+        monkeypatch.setattr("core.quick_input.read_clipboard_text",
+                            lambda: "abc")
+        self._enable(window, qapp)
+        window._on_hotkey_action("quick_paste")
+        _pump(qapp, 80)
+        assert window.state is State.IDLE
+
+
+class TestQuickInputRecorderPollution:
+    """录制防污染：热键本身与注入的按键都不能进脚本。"""
+
+    @staticmethod
+    def _record_ignored(window, qapp) -> set[str]:
+        """真跑一次「开始录制→停止」，拿到录制期间的忽略名单。"""
+        window.start_recording()
+        _pump(qapp, 60)
+        try:
+            return set(window.recorder.ignored_keys)
+        finally:
+            window.stop_recording()
+            _pump(qapp, 60)
+
+    def test_enabled_hotkeys_entered_ignore_list(self, window, qapp):
+        page = window.page_quick
+        page.chk_enabled.setChecked(True)
+        page._pwd_edits["pwd_1"].setText("Pass123")
+        page.btn_save.click()
+        _pump(qapp, 60)
+
+        ignored = self._record_ignored(window, qapp)
+        assert "f1" in ignored, "F1 是热键，不能录成一步按键"
+        assert "vk:112" in ignored, "F1 的 vk 形式（0x70=112）也要屏蔽"
+        assert "f2" in ignored
+        assert "f3" not in ignored, "没填密码的 F3 仍是普通按键，不该屏蔽"
+
+    def test_disabled_quick_input_keeps_keys_recordable(self, window, qapp):
+        """总开关关着：F1/F2/F3 就是普通按键，用户有权把它们录进脚本。"""
+        ignored = self._record_ignored(window, qapp)
+        assert "f1" not in ignored
+        assert "f2" not in ignored
+        assert "vk:112" not in ignored
+
+    def test_typing_goes_through_send_input(self, window, qapp, monkeypatch):
+        """敲击必须走 win_input 的 SendInput（不是 pynput / 剪贴板）。
+
+        默认通道是 ``KEYEVENTF_UNICODE``：``wVk`` 留 0、字符进 ``wScan``。
+        这三条缺一个就会被输入法接管（中文态下 ``b`` 变「杯」）。
+        """
+        from core import win_input
+
+        seen: list = []
+        monkeypatch.setattr(win_input, "_call_send_input",
+                            lambda inp: seen.append(inp) or 1)
+        # 钉死 unicode 通道：这里验的是「注入报文长什么样」，
+        # 走 auto 会先做一次真实注入探测（本用例把 SendInput 换成了替身）。
+        qi.type_text("a", delay_ms=1, method="unicode", sleep=lambda _s: None)
+        assert len(seen) == 2                       # 按下 + 抬起
+        assert [inp.ki.wScan for inp in seen] == [ord("a"), ord("a")]
+        assert [inp.ki.dwFlags for inp in seen] == [
+            win_input.KEYEVENTF_UNICODE,
+            win_input.KEYEVENTF_UNICODE | win_input.KEYEVENTF_KEYUP,
+        ]
+        for inp in seen:
+            assert inp.type == win_input.INPUT_KEYBOARD
+            assert inp.ki.wVk == 0

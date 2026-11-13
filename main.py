@@ -26,11 +26,18 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
 def setup_logging() -> Path:
-    """配置日志：控制台 + %APPDATA%\\MacroSmith\\logs\\macrosmith.log。"""
+    """配置日志：控制台 + %APPDATA%\\MacroSmith\\logs\\macrosmith.log。
+
+    ``--debug`` 时把级别降到 ``DEBUG``：低级键盘钩子会**逐键**记一条
+    （``core.hotkey_hook`` 的 ``log.debug``），这是排查「按了热键没反应」
+    时唯一能区分「钩子没收到」和「钩子收到但没匹配」的证据。平时不开，
+    否则正常打字一分钟就能刷几百行。
+    """
     from utils.win_utils import app_data_dir, ensure_dir
 
     log_dir = ensure_dir(app_data_dir() / "logs")
     log_file = log_dir / "macrosmith.log"
+    level = logging.DEBUG if "--debug" in sys.argv[1:] else logging.INFO
 
     handlers: list[logging.Handler] = []
     try:
@@ -42,7 +49,7 @@ def setup_logging() -> Path:
         handlers.append(logging.StreamHandler(sys.stdout))
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format=LOG_FORMAT,
         handlers=handlers or [logging.NullHandler()],
     )
@@ -116,6 +123,16 @@ def main() -> int:
     log_file = setup_logging()
     log = logging.getLogger("macrosmith")
     log.info("MacroSmith 启动，Python %s，日志：%s", sys.version.split()[0], log_file)
+    if "--debug" in sys.argv[1:]:
+        log.info("★ 调试日志已开启：钩子会逐键记录（排查热键用，平时别开）")
+    # 权限写进日志：受保护窗口投不进输入时，第一件要确认的事就是本进程
+    # 有没有管理员权限（目标完整性级别更高时，注入与窗口消息都会被静默丢掉）。
+    try:
+        from core.win_input import is_elevated
+
+        log.info("进程权限：%s", "管理员" if is_elevated() else "普通用户")
+    except Exception:  # pragma: no cover - 诊断信息不该影响启动
+        log.debug("读取进程权限失败", exc_info=True)
 
     if not acquire_single_instance():
         from PySide6.QtWidgets import QApplication, QMessageBox
@@ -170,6 +187,14 @@ def main() -> int:
     # 把当前生效的配置路径写进日志，便于排查“开发版/发布版配置不一致”的问题
     log.info("配置文件：%s", config.path)
     log.info("脚本目录：%s", config.scripts_path())
+    # 旧的 ``enc1:`` 密文只是「按用户」加密的，同一用户下别的程序也能解开；
+    # 一旦读到就立刻换成带附加熵的 ``enc2:``（见 core.quick_input._SECRET_ENTROPY）。
+    try:
+        if config.upgrade_quick_passwords():
+            config.save()
+            log.info("快捷密码已升级为「只有宏匠能解」的加密格式")
+    except Exception:  # pragma: no cover - 升级失败不该拦住启动
+        log.warning("升级快捷密码加密格式失败", exc_info=True)
 
     window = MainWindow(config)
 
@@ -205,7 +230,7 @@ def run_startup_check(app, window, log) -> int:
     hotkeys = window.hotkeys.display_map()
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QAbstractItemView, QWidget
-    from ui.main_window import PAGE_SCRIPTS
+    from ui.main_window import (PAGE_QUICK, PAGE_SCRIPTS, PAGE_SETTINGS)
     from ui.styles import SIDEBAR_WIDTH, build_stylesheet
     from utils.win_utils import load_app_icon
 
@@ -237,6 +262,30 @@ def run_startup_check(app, window, log) -> int:
     handoff_ok = (len(probe.steps) == 3
                   and probe.align_step_index_to_position() == 1   # 半步算未完成
                   and probe.position_from_step_index() == 2)      # 第 2 步的事件下标
+    # 快捷输入：过滤 + 两种注入通道的分组 + 窗口消息通道 + 密码加解密
+    from core import direct_input as di
+    from core import quick_input as qi
+    from core import win_input
+    quick_ok = (qi.sanitize("ab中文1") == "ab1"
+                and qi._unicode_groups("A!") == [[("A", False), ("A", True)],
+                                                 [("!", False), ("!", True)]]
+                and qi._vk_groups("A") == [[(qi.VK_SHIFT, False), (0x41, False),
+                                            (0x41, True), (qi.VK_SHIFT, True)]]
+                and qi.normalize_method("乱写") == qi.DEFAULT_METHOD
+                and qi.normalize_method("simulate") == "simulate"
+                # 模拟按键通道：扫描码可解析（0 表示该键没有物理键）
+                and win_input._vk_to_scan(0x41) > 0
+                # 窗口消息通道（受保护窗口）：lParam 得有真扫描码
+                and (di.key_lparam(0x41) & 0xFFFF) == 1
+                and ((di.key_lparam(0x41) >> 16) & 0xFF) > 0
+                and qi.unprotect(qi.protect("probe-1")) == "probe-1")
+    # 快捷输入已是独立一级页面（2026-11-13），控件都在 page_quick 上
+    quick_ui_ok = all(hasattr(window.page_quick, name) for name in (
+        "chk_enabled", "chk_paste", "btn_save", "spin_delay",
+        "combo_method", "_pwd_edits", "_eye_buttons"))
+    quick_page_ok = (window.pages.count() == 5
+                     and window.pages.widget(PAGE_QUICK) is window.page_quick
+                     and window.pages.widget(PAGE_SETTINGS) is window.page_settings)
     checks = [
         ("窗口标题", window.windowTitle().startswith("宏匠"), window.windowTitle()),
         ("原生窗口边框", (not (window.windowFlags() & Qt.FramelessWindowHint))
@@ -247,7 +296,9 @@ def run_startup_check(app, window, log) -> int:
         ("窗口可缩放", window.maximumWidth() > 10000 and window.minimumWidth() >= 800,
          f"最小 {window.minimumWidth()}x{window.minimumHeight()}，无固定尺寸限制"),
         ("默认页为「回放与脚本」", window.pages.currentIndex() == PAGE_SCRIPTS,
-         "回放与脚本 / 录制与步骤编辑 / 设置 / 关于"),
+         "回放与脚本 / 录制与步骤编辑 / 快捷输入 / 设置 / 关于"),
+        ("快捷输入是独立一级页面", quick_page_ok,
+         f"第 {PAGE_QUICK + 1} 页；设置顺延到第 {PAGE_SETTINGS + 1} 页"),
         ("侧边栏宽度", window.sidebar.width() == SIDEBAR_WIDTH,
          f"{window.sidebar.width()}px（期望 {SIDEBAR_WIDTH}px）"),
         ("侧边栏无「回放」入口", not hasattr(window.sidebar, "btn_play"),
@@ -288,7 +339,9 @@ def run_startup_check(app, window, log) -> int:
         ("热键独占模式", window.hotkeys.exclusive,
          "已开启（命中热键不再传给前台程序）" if window.hotkeys.exclusive
          else "已关闭（按键会同时触发前台程序）"),
-        ("热键绑定完整", len(hotkeys) == 9, "、".join(f"{k}={v}" for k, v in hotkeys.items())),
+        ("热键绑定完整",
+         sum(1 for a in hotkeys if not a.startswith("quick_")) == 9,
+         "、".join(f"{k}={v}" for k, v in hotkeys.items())),
         ("停止录制键不入脚本", "f9" in window.recorder.ignored_keys
          and "f11" in window.recorder.ignored_keys,
          "、" .join(sorted(window.recorder.ignored_keys))),
@@ -312,6 +365,12 @@ def run_startup_check(app, window, log) -> int:
         ("回放↔单步接力", handoff_ok,
          "回放暂停后按单步接着往下走（半步算未完成，从这一步开头重跑）；"
          "单步几步后按回放从下一步接着放"),
+        ("快捷输入（文本模拟打字）", quick_ok and quick_ui_ok,
+         "F1 敲剪贴板 / F2–F4 敲三个快捷密码：ASCII 过滤 + SendInput 物理按键"
+         "（键码与扫描码都填准，最接近真键盘）；敲字前先在指针位置补一次左键"
+         "（页面内输入框只认真实鼠标按下）；探针发现注入进不去时依次降级为"
+         "仅扫描码与窗口消息（WM_CHAR）；默认关闭、需手动开启一次；"
+         "密码用 DPAPI + 附加熵加密（只有本程序解得开）；录制期间自动失效"),
         ("录制器待命", not window.recorder.is_recording, "未录制"),
         ("回放器待命", not window.player.is_replaying, "未回放"),
     ]

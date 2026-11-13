@@ -14,8 +14,10 @@ pynput 的 ``Listener`` 只是**旁观**按键（挂一个低级钩子读取事�
 ----
 * 钩子回调运行在自己的消息循环线程里，不占用 Qt 主线程；
 * 只拦截「已注册 + 本次没被吃掉」的虚拟键；其它按键原样放行；
-* **程序自己注入**的按键（``LLKHF_INJECTED``）一律放行，
-  否则会让模拟输入失效甚至递归；
+* **只放行「本程序自己注入」的按键**（``dwExtraInfo == INJECT_TAG``），
+  否则回放/快捷输入敲出的键会再次触发热键甚至递归。★ 不能按
+  ``LLKHF_INJECTED`` 一刀切——有的安全软件会把**真人按键重新注入**再往下传，
+  那样热键会被误当成「自己敲的」而彻底失效（见 :func:`should_passthrough`）；
 * 卸载时先 ``UnhookWindowsHookEx`` 再 ``PostThreadMessageW(WM_QUIT)``
   结束消息循环，保证退出后系统键盘恢复正常。
 
@@ -35,6 +37,11 @@ import threading
 from ctypes import wintypes
 from typing import Callable, Iterable, Optional
 
+#: 本程序注入事件时写进 ``dwExtraInfo`` 的标记（"MS"）。定义在
+#: ``core.win_input``——那是唯一会调 ``SendInput`` 的地方，钩子在这里认领
+#: 「自己敲的键」。win_input 不反向依赖本模块，不存在循环导入。
+from core.win_input import INJECT_TAG
+
 log = logging.getLogger(__name__)
 
 IS_WINDOWS = hasattr(ctypes, "windll")
@@ -53,6 +60,33 @@ WM_QUIT = 0x0012
 LLKHF_INJECTED = 0x00000010
 LLKHF_LOWER_IL_INJECTED = 0x00000002
 
+
+def should_passthrough(flags: int, extra_info: int = 0) -> bool:
+    """这条键盘事件要不要原样放行（不参与热键判断）。
+
+    ★ **只按 ``dwExtraInfo`` 认领自己注入的事件**，别的全部当真人按键。
+
+    历史（这条规则被实测推翻过两次，别再改回去）：
+
+    1. 最初「``LLKHF_INJECTED`` 一律放行」→ 2026-11-12 实测 QQ 游戏大厅
+       把真人按下的 F2/F3 用 ``[INJECTED] extra=0x21`` 重发，热键永远等不到。
+    2. 改成「自己注入的 + ``LLKHF_LOWER_IL_INJECTED`` 一律放行」→ 同一天
+       19:24 在 QQ 登录框上又栽同样的跟头：**宏匠是管理员，QQ 是普通权限**，
+       于是 QQ 重发的真人按键带上了 ``LOWER_IL_INJECTED``（``flags=0x12``），
+       被这条规则当成「别人的自动化」放走，日志里连一行快捷输入都没有。
+       而同一次按住 F3 偶尔以 ``flags=0x0000``（纯硬件）到达，就一切正常——
+       这正好解释了「同一条热键时灵时不灵」。
+
+    结论：``INJECTED`` / ``LOWER_IL_INJECTED`` 两个标志位都**不能**用来判断
+    「是不是我自己敲的」，只有 ``dwExtraInfo`` 里那个标记能（见 ``INJECT_TAG``）。
+
+    为什么可以安全地取消「更低权限注入一律放行」：那类事件本来就是**别的进程
+    发出来的按键**，跟我们无关，按真人按键处理最接近事实；真正需要防的
+    「回放/快捷输入自我触发」由 :meth:`HotkeyManager._should_block_vk` 的
+    ``is_executing`` 守卫负责（回放期间一律不认热键），与这里无关。
+    """
+    return (int(extra_info) & 0xFFFFFFFF) == INJECT_TAG
+
 #: 判断钩子是否仍然有效（HM_NCOM，Chrome 与多个安全软件也用它做探活）
 _HM_NCOM = 0x001D
 _SMTO_ABORTIFHUNG = 0x0002
@@ -64,6 +98,34 @@ PROTECTED_VKS = frozenset({
     0x5C,  # RWin
     0x1B,  # Esc
 })
+
+#: 快捷输入的热键（F1–F4）。这四个键即使**没匹配上**也要记一条日志：
+#: 「按了没反应」有两种完全不同的原因——①钩子根本没收到事件（被上游的
+#: 安全输入组件/驱动吃掉）；②钩子收到了但动作表里没有它（绑定丢了）。
+#: 不打这一行，两种情况在日志里长得一模一样（都是空白）。
+_QUICK_VKS = frozenset({0x70, 0x71, 0x72, 0x73})
+
+#: 日志里显示的热键名（只是给人看的，缺的显示 ``?``）
+_KEY_NAMES = {
+    0x70: "F1", 0x71: "F2", 0x72: "F3", 0x73: "F4", 0x74: "F5",
+    0x75: "F6", 0x76: "F7", 0x77: "F8", 0x78: "F9", 0x79: "F10",
+    0x7A: "F11", 0x7B: "F12", 0x21: "PageUp", 0x22: "PageDown",
+    0x24: "Home", 0x1B: "Esc",
+}
+
+
+def _foreground_class() -> str:
+    """前台窗口类名（只用于日志，取不到返回空串）。"""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if not hwnd:
+            return ""
+        buf = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, buf, 128)
+        return buf.value
+    except Exception:  # pragma: no cover - 诊断信息不影响主流程
+        return ""
 
 if IS_WINDOWS:
     ULONG_PTR = wintypes.WPARAM
@@ -161,6 +223,10 @@ class KeyboardHook:
         self._running = False
         self._last_error = ""
         self._blocked_count = 0
+        #: 是否已经在这台机器上见过「别人注入的按键」。见一次就够——这条日志
+        #: 是「热键为什么没反应」的第一现场（QQ 登录框那类安全输入会把真人
+        #: 按键重新注入）。只打一次，别把日志刷爆。
+        self._seen_foreign_inject = False
 
     # ------------------------------------------------------------------
     # 状态
@@ -314,13 +380,34 @@ class KeyboardHook:
             info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = int(info.vkCode)
             message = int(w_param)
-
-            # 程序自己注入的按键一律放行，否则模拟输入会失效甚至递归
-            if info.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED):
-                return user32.CallNextHookEx(None, n_code, w_param, l_param)
-
             is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
             is_up = message in (WM_KEYUP, WM_SYSKEYUP)
+
+            # ★ 逐键记录（只在 ``--debug`` 下可见）。这是排「按了热键没反应」的
+            # 第一现场：日志里**一条都没有**，说明事件根本没到本进程的钩子
+            # （被上游的安全输入组件或驱动吃掉了）；有这一行但下面没有
+            # 「热键动作」，才是绑定/匹配的问题。不记这一行，两种情况都是空白。
+            if is_down and log.isEnabledFor(logging.DEBUG):
+                log.debug("钩子收到按键 vk=%#06x flags=%#06x extra=%#x 前台=%r",
+                          vk, int(info.flags), int(info.dwExtraInfo),
+                          _foreground_class())
+
+            # 只放行「自己注入的」与「更低权限注入的」，其余注入事件照常参与
+            # 热键判断——有的安全软件会把真人按键重新注入（见 should_passthrough）。
+            passthrough = should_passthrough(info.flags, int(info.dwExtraInfo))
+            if info.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED):
+                # 只在 DEBUG 记：这一行是排「热键没反应」的唯一现场证据
+                # （谁注入的、带什么 extra、有没有被当成热键）。
+                log.debug("注入事件 vk=%#06x flags=%#06x extra=%#x 放行=%s",
+                          vk, int(info.flags), int(info.dwExtraInfo), passthrough)
+                if not passthrough and not self._seen_foreign_inject:
+                    self._seen_foreign_inject = True
+                    log.info("检测到别的程序注入的按键（vk=%#06x extra=%#x）："
+                             "按真人按键处理——某些安全输入组件会重新注入按键",
+                             vk, int(info.dwExtraInfo))
+            if passthrough:
+                return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
             if not (is_down or is_up) or vk in PROTECTED_VKS:
                 return user32.CallNextHookEx(None, n_code, w_param, l_param)
 
@@ -330,6 +417,14 @@ class KeyboardHook:
             except Exception:  # pragma: no cover - 回调异常不能中断钩子链
                 log.debug("should_block 回调异常", exc_info=True)
                 should = False
+
+            # 快捷输入的热键（F1–F4）不论命中与否都留一行现场证据：
+            # 只有这一行能区分「钩子没收到」和「收到了但没匹配」。
+            if is_down and (should or vk in _QUICK_VKS):
+                log.info("钩子看到按键 vk=%#06x（%s）命中=%s 注入=%s extra=%#x 前台=%r",
+                         vk, _KEY_NAMES.get(vk, "?"), should,
+                         bool(info.flags & LLKHF_INJECTED),
+                         int(info.dwExtraInfo), _foreground_class())
 
             if not should:
                 return user32.CallNextHookEx(None, n_code, w_param, l_param)

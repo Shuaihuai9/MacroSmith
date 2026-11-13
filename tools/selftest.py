@@ -44,8 +44,10 @@ except ImportError:  # pragma: no cover
 PASS = "  [通过]"
 FAIL = "  [失败]"
 WARN = "  [注意]"
+SKIP = "  [跳过]"
 
 _results: list[tuple[str, bool, str]] = []
+_skipped: list[tuple[str, str]] = []
 
 
 def check(title: str, ok: bool, detail: str = "") -> bool:
@@ -53,6 +55,17 @@ def check(title: str, ok: bool, detail: str = "") -> bool:
     _results.append((title, ok, detail))
     print(f"{PASS if ok else FAIL} {title}" + (f" —— {detail}" if detail else ""))
     return ok
+
+
+def skip(title: str, detail: str = "") -> None:
+    """记录一条“因环境限制无法验证”的检查。
+
+    与 :func:`check(False)` 严格区分：失败代表代码有问题，跳过代表
+    这台机器/这个桌面会话根本不具备验证条件（例如游戏反作弊、远程
+    桌面、锁屏会拦截一切注入输入）。混为一谈会让自检失去信号价值。
+    """
+    _skipped.append((title, detail))
+    print(f"{SKIP} {title}" + (f" —— {detail}" if detail else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +184,17 @@ def check_parser() -> None:
               f"duration={payload.get('duration_ms')}ms")
 
 
+def _wait_inject_tail() -> None:
+    """等过「注入尾巴」（见 ``core.player._INJECT_TAIL_S``）。
+
+    注入刚结束时 ``is_executing`` 仍为 True —— 那段窗口是留给异步抵达的钩子
+    事件的（``SendInput`` 返回 ≠ 事件已被派发）。断言「标志已归位」必须跨过它。
+    """
+    from core.player import _INJECT_TAIL_S
+
+    time.sleep(_INJECT_TAIL_S + 0.02)
+
+
 def check_player_timed() -> None:
     print("\n[4] 模式一 原速回放（时间轴精度）")
     from core.player import MacroPlayer
@@ -203,6 +227,7 @@ def check_player_timed() -> None:
         check("逐帧落点误差 < 20ms", worst < 20.0, f"最大误差 {worst:.1f}ms")
         check("移动落点内容正确", mouse.moves() == [(10, 10), (20, 20), (30, 30), (40, 40)],
               str(mouse.moves()))
+    _wait_inject_tail()
     check("回放结束后 is_executing 归位", player.is_executing is False)
 
     # ---- 注入期间标志位必须为 True：在控制器回调里精确采样，避免时序竞态 ----
@@ -349,6 +374,7 @@ def check_execution_flag() -> None:
     player.load([ep.make_key_event(0, "press", "vk:65", 65)], "flag")
     player.step_next()
     check("注入事件期间标志位为 True", sampled == [True], f"observed={sampled}")
+    _wait_inject_tail()
     check("注入结束后标志位为 False", player.is_executing is False)
 
     # 模式一在后台线程注入，同样必须置位（在控制器回调里精确采样）
@@ -1515,6 +1541,69 @@ def check_window_resize() -> None:
             app.processEvents()
 
 
+def _foreground_desc() -> str:
+    """前台窗口的进程名 / 标题，用于说明“是谁在拦截注入输入”。"""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        hwnd = u32.GetForegroundWindow()
+        title = ctypes.create_unicode_buffer(256)
+        u32.GetWindowTextW(hwnd, title, 256)
+        pid = wt.DWORD()
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(1024)
+        handle = k32.OpenProcess(0x1000, False, pid.value)
+        name = ""
+        if handle:
+            k32.QueryFullProcessImageNameW(handle, 0, exe, ctypes.byref(size))
+            name = exe.value.rsplit("\\", 1)[-1]
+            k32.CloseHandle(handle)
+        text = title.value.strip()
+        if name and text:
+            return f"{name}（{text}）"
+        return name or text or "未知窗口"
+    except Exception:  # pragma: no cover - 纯诊断信息，取不到不影响结论
+        return "未知窗口"
+
+
+def _injection_blocked_detail() -> str:
+    return ("桌面会话禁止注入键盘/鼠标事件（常见原因：游戏反作弊、远程桌面、"
+            f"锁屏），当前前台窗口为 {_foreground_desc()}")
+
+
+def _inject_probe_events(key_ctl, count: int = 2) -> int:
+    """用**独立于 Recorder** 的原生监听器验证「本环境是否允许注入按键」。
+
+    返回独立监听器实际收到的按键事件数。0 说明注入被系统拦截——
+    此时 Recorder 收不到事件属于环境限制而非代码缺陷；>0 而 Recorder
+    仍是 0，则说明录制链路真的坏了，必须判失败。
+    """
+    from pynput import keyboard as kb
+
+    seen: list = []
+    listener = kb.Listener(on_press=lambda *a: seen.append(a),
+                           on_release=lambda *a: seen.append(a))
+    listener.daemon = True
+    listener.start()
+    try:
+        time.sleep(0.25)
+        for _ in range(count):
+            key_ctl.press("q")
+            time.sleep(0.06)
+            key_ctl.release("q")
+            time.sleep(0.12)
+    finally:
+        try:
+            listener.stop()
+            listener.join(timeout=1.0)
+        except Exception:  # pragma: no cover
+            pass
+    return len(seen)
+
+
 def check_os_hooks() -> None:
     """真实安装一次系统钩子，验证“录制链路能跑通、且忽略自身注入”。
 
@@ -1558,8 +1647,21 @@ def check_os_hooks() -> None:
     seen_moves = [e for e in raw if e["type"] == "mouse_move"]
     seen_keys = [e for e in raw if e["type"] == "key"]
     check("真实鼠标移动被录制", len(seen_moves) >= 1, f"{len(seen_moves)} 条移动事件")
-    check("真实键盘输入被录制", len(seen_keys) >= 2,
-          f"{len(seen_keys)} 条键盘事件：{[ep.describe(e) for e in seen_keys[:2]]}")
+
+    # 键盘收不到事件时，用一条独立于 Recorder 的原生监听器做 A/B：
+    # 连它也收不到 -> 本桌面会话禁止注入（游戏反作弊/远程桌面/锁屏），
+    # 属于环境限制，记「跳过」；它能收到而 Recorder 收不到 -> 真回归，判失败。
+    injection_blocked = False
+    if len(seen_keys) >= 2:
+        check("真实键盘输入被录制", True,
+              f"{len(seen_keys)} 条键盘事件：{[ep.describe(e) for e in seen_keys[:2]]}")
+    elif _inject_probe_events(key_ctl) == 0:
+        injection_blocked = True
+        skip("真实键盘输入被录制", _injection_blocked_detail())
+    else:
+        check("真实键盘输入被录制", False,
+              f"{len(seen_keys)} 条键盘事件（独立监听器能收到注入按键，"
+              "说明录制链路本身有问题）")
 
     # ---- 2) 回放注入的点击：必须被忽略，不能被录进来 ----
     before_clicks = len([e for e in raw if e["type"] == "mouse_click"])
@@ -1570,8 +1672,12 @@ def check_os_hooks() -> None:
     player.step_next()
     time.sleep(0.2)
     after_clicks = len([e for e in raw if e["type"] == "mouse_click"])
-    check("回放注入的点击没有被再次录制", after_clicks == before_clicks,
-          f"注入前 {before_clicks} 条，注入后 {after_clicks} 条")
+    if injection_blocked and after_clicks == 0:
+        # 点击同样注不进去，这一步没有可观察对象，如实跳过
+        skip("回放注入的点击没有被再次录制", _injection_blocked_detail())
+    else:
+        check("回放注入的点击没有被再次录制", after_clicks == before_clicks,
+              f"注入前 {before_clicks} 条，注入后 {after_clicks} 条")
 
     # ---- 3) 抖动过滤：一次性小位移应被丢弃 ----
     jitter_before = len(raw)
@@ -1585,14 +1691,116 @@ def check_os_hooks() -> None:
     check("停止录制后监听器已关闭", not recorder.is_recording)
     check("录制过程无错误", not errors, f"errors={errors}")
     key_after_stop = [e for e in events if e["type"] == "key"]
-    check("停止录制后返回清洗过的事件序列", len(key_after_stop) >= 2,
-          f"{len(events)} 条事件 / {len(key_after_stop)} 条键盘事件")
+    if injection_blocked and not key_after_stop:
+        skip("停止录制后返回清洗过的事件序列", _injection_blocked_detail())
+    else:
+        check("停止录制后返回清洗过的事件序列", len(key_after_stop) >= 2,
+              f"{len(events)} 条事件 / {len(key_after_stop)} 条键盘事件")
 
     # 收尾清理：把鼠标放回原位，避免影响用户
     try:
         mouse_ctl.position = start_pos
     except Exception:  # pragma: no cover
         pass
+
+
+def check_direct_input() -> None:
+    """窗口消息通道：不碰真实窗口，只验证消息序列与 lParam 组装。
+
+    这条通道是给「反注入驱动拦掉 ``SendInput``」的场景准备的
+    （QQ 游戏大厅实测如此），坏掉的话那类窗口就一个字都进不去。
+    """
+    print("\n[26] 窗口消息注入通道（受保护窗口用）")
+    from core import direct_input as di
+
+    lp = di.key_lparam(0x41)
+    check("按键消息带重复次数与扫描码", (lp & 0xFFFF) == 1 and ((lp >> 16) & 0xFF) > 0,
+          f"lParam={lp:#010x}")
+    check("抬起消息带前三态/转换位",
+          bool(di.key_lparam(0x41, up=True) & (1 << 31)))
+
+    posted: list[tuple] = []
+    typed = di.type_text("aB", hwnd=1, delay_ms=1,
+                         post=lambda *a: posted.append(a) or True,
+                         sleep=lambda _s: None)
+    chars = [chr(w) for (_h, msg, w, _lp) in posted if msg == di.WM_CHAR]
+    check("逐字符投递 WM_CHAR", typed == 2 and chars == ["a", "B"], f"{chars}")
+    check("每字符只发一条消息（多发会重复上屏）",
+          len(posted) == 2 and all(msg == di.WM_CHAR
+                                   for (_h, msg, _w, _lp) in posted),
+          f"共 {len(posted)} 条消息")
+
+    # 找不到焦点控件时必须明确放弃，而不是往 0 号窗口乱发
+    saved = di.focus_window
+    di.focus_window = lambda: 0
+    try:
+        check("没有焦点窗口时不乱发", di.type_text("ab", delay_ms=1) == 0)
+    finally:
+        di.focus_window = saved
+
+
+def check_inject_ladder() -> None:
+    """注射通道阶梯：字符 -> 扫描码 -> 窗口消息，以及原生注入入口。
+
+    这三级的顺序是排障结论，不是随便排的：字符通道最稳；扫描码通道能过
+    一部分只按标志位过滤的保护模块；两条都不通才该退到窗口消息。
+    """
+    print("\n[27] 注入通道阶梯（字符 / 扫描码 / 窗口消息）")
+    from core import quick_input as qi
+    from core import win_input
+
+    entry = win_input.native_send_input()
+    check("原生注入入口可解析",
+          entry is None or callable(entry),
+          "win32u!NtUserSendInput 可用" if entry else
+          "本机未导出，退回 user32!SendInput（不影响功能）")
+
+    sent: list = []
+    saved_call = win_input._call_send_input
+    win_input._call_send_input = lambda inp: sent.append(inp) or 1
+    try:
+        ok = win_input.send_key_scancode(0x41)
+        check("扫描码通道只用 wScan（wVk 必须留 0）",
+              ok and sent and sent[0].ki.wVk == 0
+              and sent[0].ki.dwFlags & win_input.KEYEVENTF_SCANCODE,
+              f"wScan={sent[0].ki.wScan:#04x}" if sent else "未发出事件")
+        sent.clear()
+        ok = win_input.send_physical_key(0x41)
+        check("物理按键通道 wVk 与 wScan 都填准",
+              ok and sent and sent[0].ki.wVk == 0x41
+              and sent[0].ki.wScan == 0x1E and sent[0].ki.dwFlags == 0,
+              f"wVk={sent[0].ki.wVk:#04x} wScan={sent[0].ki.wScan:#04x}"
+              if sent else "未发出事件")
+    finally:
+        win_input._call_send_input = saved_call
+
+    # 阶梯选择：探针结果决定走哪一级
+    saved_probe = qi.injection_delivered
+    saved_senders = dict(qi._SENDERS)
+    try:
+        qi.injection_delivered = lambda *, scancode=False: scancode
+        qi._SENDERS["simulate"] = lambda payload, up: True
+        seen: list[str] = []
+        qi.type_text("ab", delay_ms=1, sleep=lambda _s: None, report=seen.append)
+        check("字符通道被拦时改走模拟按键", seen == ["simulate"], f"{seen}")
+
+        qi.injection_delivered = lambda *, scancode=False: False
+        qi._SENDERS["simulate"] = lambda payload, up: False
+        saved_type = __import__("core.direct_input", fromlist=["x"]).type_text
+        import core.direct_input as di_mod
+        used: list[str] = []
+        di_mod.type_text = lambda text, **kw: used.append(text) or 0
+        try:
+            seen.clear()
+            qi.type_text("ab", delay_ms=1, sleep=lambda _s: None, report=seen.append)
+            check("两级注入都失效时整段改走窗口消息",
+                  used == ["ab"] and seen == ["message-failed"], f"{seen}")
+        finally:
+            di_mod.type_text = saved_type
+    finally:
+        qi.injection_delivered = saved_probe
+        qi._SENDERS.clear()
+        qi._SENDERS.update(saved_senders)
 
 
 def main() -> int:
@@ -1626,15 +1834,25 @@ def main() -> int:
     check_dialog_styles()
     check_window_resize()
     check_os_hooks()
+    check_direct_input()
+    check_inject_ladder()
 
     total = len(_results)
     failed = [r for r in _results if not r[1]]
     print("\n" + "=" * 66)
-    print(f"自检结果：{total - len(failed)}/{total} 项通过")
+    if _skipped:
+        print(f"自检结果：{total - len(failed)}/{total} 项通过"
+              f"（另有 {len(_skipped)} 项因环境限制跳过）")
+    else:
+        print(f"自检结果：{total - len(failed)}/{total} 项通过")
     if failed:
         print("未通过项：")
         for title, _ok, detail in failed:
             print(f"  × {title} {detail}")
+    if _skipped:
+        print("跳过项（环境不支持，非代码问题）：")
+        for title, detail in _skipped:
+            print(f"  - {title} {detail}")
     print("=" * 66)
     return 1 if failed else 0
 

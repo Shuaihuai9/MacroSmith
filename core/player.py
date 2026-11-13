@@ -49,6 +49,16 @@ _STEP_MAX_GAP_MS = 60
 #: 5ms 足以让系统按顺序处理，同时远小于双击判定窗口。
 _MERGED_STEP_MAX_GAP_MS = 5
 
+#: 注入结束后仍然认作「自身事件」的尾巴窗口（秒）。
+#:
+#: ``SendInput`` 返回只说明事件已交给系统；低级键盘/鼠标钩子由系统在**另一个
+#: 线程**里派发，实测延迟 1–20ms，机器繁忙（GIL 争用、别人正在点鼠标）时更久。
+#: 只靠注入瞬间置位的 :attr:`MacroPlayer._exec_depth`，迟到的事件抵达录制器时
+#: 计数已经归零，于是「回放自己注入的点击」被录成了新步骤（自检第 25 项偶发
+#: 失败就是这个）。60ms 覆盖实测延迟并留足余量；录制时回放器并不工作，
+#: 所以不会吞掉用户的真实输入。
+_INJECT_TAIL_S = 0.06
+
 #: 插值移动步骤（模式二）的补帧间隔（毫秒）。
 #: 10~15ms 约等于 60~100fps，与真人移动的事件密度相当：再密会被系统
 #: 合并掉中间帧，hover 状态来不及生效；再疏轨迹就发顿。
@@ -123,6 +133,9 @@ class MacroPlayer:
         # 忽略自身事件用的可重入深度计数
         self._guard_lock = threading.Lock()
         self._exec_depth = 0
+        #: 最后一次注入结束的时刻（monotonic 秒）：注入事件抵达钩子是异步的，
+        #: 计数归零后还要按 :data:`_INJECT_TAIL_S` 继续认作「自身事件」。
+        self._last_inject_ts = 0.0
 
         self._mouse: Optional[mouse.Controller] = None
         self._keyboard: Optional[keyboard.Controller] = None
@@ -160,9 +173,17 @@ class MacroPlayer:
     # ==================================================================
     @property
     def is_executing(self) -> bool:
-        """当前是否正在发送模拟事件（录制器据此忽略自身事件）。"""
+        """当前是否正在发送模拟事件（录制器据此忽略自身事件）。
+
+        除「正在注入」之外，注入**刚结束的一小段**也返回 True：事件从
+        ``SendInput`` 交出去到被低级钩子派发回来有 1–20ms 的异步延迟，
+        只看计数器会漏掉迟到的那几条，被录制器当成用户操作录进新脚本。
+        录制时回放器并不工作，这段窗口不会吞掉真实输入。
+        """
         with self._guard_lock:
-            return self._exec_depth > 0
+            if self._exec_depth > 0:
+                return True
+            return (time.monotonic() - self._last_inject_ts) < _INJECT_TAIL_S
 
     # ------------------------------------------------------------------
     # 循环回放设置
@@ -985,7 +1006,13 @@ class MacroPlayer:
 
 
 class _ExecGuard:
-    """把 ``MacroPlayer._exec_depth`` 加一/减一的上下文管理器。"""
+    """把 ``MacroPlayer._exec_depth`` 加一/减一的上下文管理器。
+
+    退出时顺手记下「刚注入过」的时刻：``SendInput`` 返回只代表事件已交给
+    系统，低级钩子回调是**另一个线程**异步派发的（实测 1–20ms，机器繁忙时
+    更久）。只在注入瞬间置位的计数器会漏掉这些迟到事件——它们抵达录制器时
+    计数已归零，于是回放自己注入的点击被录成了新步骤。
+    """
 
     __slots__ = ("_player",)
 
@@ -1000,4 +1027,5 @@ class _ExecGuard:
     def __exit__(self, exc_type, exc, tb) -> bool:
         with self._player._guard_lock:
             self._player._exec_depth = max(0, self._player._exec_depth - 1)
+            self._player._last_inject_ts = time.monotonic()
         return False

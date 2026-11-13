@@ -335,7 +335,20 @@ class Recorder:
         except Exception as exc:  # pragma: no cover
             self._notify_error(f"处理鼠标滚轮事件出错：{exc}")
 
-    def _handle_press(self, key: Any) -> None:
+    def _handle_press(self, key: Any, injected: bool = False) -> None:
+        """按键按下。
+
+        ``injected`` 由 pynput 提供（它把 ``LLKHF_INJECTED`` 翻译成这个布尔量），
+        但这里**故意不据此丢弃**：屏幕键盘、远程桌面、键盘改键工具发出的都是
+        注入事件，用户同样希望它们被录下来（`tools/selftest.py` 就是靠注入
+        模拟真实按键的，"注入即丢弃"会让这类输入全部录不到）。
+
+        真正的防污染在别处：回放期间的注入由 ``_is_executing`` 整体静音；
+        快捷输入在录制期间根本不启动，且打字途中一旦开始录制会立刻中止
+        （见 ``core.quick_input.type_text`` 的 ``should_stop``）。
+        形参仍然保留：pynput 的 ``_wrap`` 按形参个数裁剪实参，
+        不声明就取不到这个信息，将来要用还得改签名。
+        """
         try:
             if self._skip():
                 return
@@ -346,7 +359,7 @@ class Recorder:
         except Exception as exc:  # pragma: no cover
             self._notify_error(f"处理键盘按下事件出错：{exc}")
 
-    def _handle_release(self, key: Any) -> None:
+    def _handle_release(self, key: Any, injected: bool = False) -> None:
         try:
             if self._skip():
                 return

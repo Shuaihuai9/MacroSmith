@@ -21,6 +21,7 @@ ICON_STEP = "step"
 ICON_LIBRARY = "library"
 ICON_SETTINGS = "settings"
 ICON_ABOUT = "about"
+ICON_KEYBOARD = "keyboard"
 ICON_BACK = "back"
 
 # 编辑工具栏图标
@@ -221,6 +222,36 @@ def _paint_about(painter: QPainter, box: QRectF, pen: QPen, color: QColor) -> No
     )
 
 
+def _paint_keyboard(painter: QPainter, box: QRectF, pen: QPen,
+                    color: QColor) -> None:
+    """快捷输入：键盘轮廓 + 两排键位点。
+
+    画的是一个「扁圆角矩形 + 内部小方块」的经典键盘剪影；键位用实心小方块，
+    在 21px 的尺寸下仍然分得清，不会糊成一片。
+    """
+    painter.setPen(pen)
+    body = QRectF(_r(box, 0.08, 0.26), _r(box, 0.92, 0.74))
+    painter.drawRoundedRect(body, box.width() * 0.10, box.width() * 0.10)
+
+    painter.save()
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(pen.color())
+    size = box.width() * 0.075
+    for row, fy in enumerate((0.40, 0.55)):
+        count = 4 if row == 0 else 3
+        start = 0.20 if row == 0 else 0.28
+        step = 0.60 / max(1, count - 1)
+        for i in range(count):
+            center = _r(box, start + step * i, fy)
+            painter.drawRect(QRectF(center.x() - size / 2,
+                                    center.y() - size / 2, size, size))
+    # 空格键：一条短横
+    painter.drawRoundedRect(
+        QRectF(_r(box, 0.34, 0.635), _r(box, 0.66, 0.665)),
+        size * 0.5, size * 0.5)
+    painter.restore()
+
+
 def _paint_back(painter: QPainter, box: QRectF, pen: QPen, color: QColor) -> None:
     """返回：左向箭头。"""
     painter.setPen(pen)
@@ -352,6 +383,7 @@ _DRAWERS = {
     ICON_LIBRARY: _paint_library,
     ICON_SETTINGS: _paint_settings,
     ICON_ABOUT: _paint_about,
+    ICON_KEYBOARD: _paint_keyboard,
     ICON_BACK: _paint_back,
     ICON_CHECK_ALL: _paint_check_all,
     ICON_CHECK_NONE: _paint_check_none,

@@ -3,15 +3,18 @@
 热键捕获控件 :class:`HotkeyEdit` 直接截获按键事件（不依赖全局钩子），
 文本框中显示 ``F9``、``PageDown`` 等键名；保存时统一交给
 :class:`core.hotkey_manager.HotkeyManager` 重新注册。
+
+★ 快捷输入**不在这里**：它已独立成一级页面（``ui/quick_page.py``）。
+两页共用的只有 :class:`HotkeyEdit`（从本模块导入），别再把它搬回去。
 """
 
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox, QFormLayout,
-                               QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QScrollArea, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QScrollArea,
+                               QVBoxLayout, QWidget)
 
 from core.config import DEFAULT_HOTKEYS, HOTKEY_LABELS
 from core.hotkey_manager import display_name, normalize_token, probe_hotkey
