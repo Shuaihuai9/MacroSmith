@@ -34,7 +34,8 @@ from core import event_parser as ep                              # noqa: E402
 from core import quick_input as qi                               # noqa: E402
 from core.config import DEFAULT_HOTKEYS, Config                   # noqa: E402
 from core.hotkey_hook import hook_supported                       # noqa: E402
-from core.hotkey_sets import STANDARD_KEY, find_set, sets_dir      # noqa: E402
+from core.hotkey_sets import (STANDARD_KEY, USER_PREFIX, find_set,  # noqa: E402
+                              sets_dir)
 from core.player import MODE_STEP, MODE_TIMED                    # noqa: E402
 from ui import styles                                            # noqa: E402
 from ui.main_window import (PAGE_ABOUT, PAGE_LIBRARY, PAGE_RECORD,   # noqa: E402
@@ -4775,6 +4776,57 @@ class TestHotkeyProfileGUI:
         assert fresh.config.hotkey("quick_paste") == "f7"
         # 总开关文案跟着实际按键走，不再写死 F1–F4
         assert "F7" in page.chk_enabled.text()
+
+    def test_delete_user_set_clears_bindings(self, fresh, qapp, tmp_path):
+        """「删除此套」：删掉套文件 + 清空当前绑定 + 下拉回到「未设置」。"""
+        # 先造一个用户套出来（改一个键就自动另存）
+        edit = fresh.page_settings._edits["record_stop"]
+        edit.set_token("f10")
+        fresh.page_settings.btn_save.click()
+        _pump(qapp, 80)
+        key = fresh.config.hotkey_profile
+        assert key.startswith(USER_PREFIX)
+        path = sets_dir(fresh.config.path) / "我的热键.json"
+        assert path.exists()
+
+        fresh.page_settings.btn_profile_delete.click()
+        _pump(qapp, 80)
+
+        assert not path.exists(), "套文件要被删掉"
+        assert fresh.config.hotkey_profile == ""
+        assert fresh.config.hotkeys == {}
+        assert fresh.config.hotkey("record_stop") == ""
+        assert fresh.hotkeys.binding_display("record_stop") == ""   # 真的释放了
+        assert find_set(fresh.config.path, key) is None
+        assert "已删除热键套" in fresh.message_label.text()
+
+    def test_delete_builtin_set_is_refused(self, fresh, qapp):
+        """内置「标准套」删不掉：按钮直接禁用，底层也有一道拒绝。"""
+        combo = fresh.page_settings.combo_profile
+        combo.setCurrentIndex(combo.findData(STANDARD_KEY))
+        _pump(qapp, 60)
+        assert fresh.config.hotkey("record_stop") == "f9"
+        # 第一层：当前是内置套，按钮本身就不给点
+        assert fresh.page_settings.btn_profile_delete.isEnabled() is False
+
+        # 第二层：就算绕过来直接调，也只提示不执行
+        fresh._delete_profile()
+        _pump(qapp, 40)
+        assert fresh.config.hotkey_profile == STANDARD_KEY
+        assert fresh.config.hotkey("record_stop") == "f9"
+        assert "不能删除" in fresh.message_label.text()
+        assert find_set(fresh.config.path, STANDARD_KEY) is not None
+
+    def test_delete_button_enabled_only_for_user_set(self, fresh, qapp):
+        """选中「未设置」时也不能删（没有套可删），选了用户套才可以。"""
+        combo = fresh.page_settings.combo_profile
+        assert fresh.page_settings.btn_profile_delete.isEnabled() is False
+
+        edit = fresh.page_settings._edits["record_stop"]
+        edit.set_token("f10")
+        fresh.page_settings.btn_save.click()
+        _pump(qapp, 80)
+        assert fresh.page_settings.btn_profile_delete.isEnabled() is True
 
 
 class TestHotkeyClearAndConflict:
