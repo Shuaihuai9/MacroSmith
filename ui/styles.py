@@ -313,6 +313,38 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
     background: #FAFAFA;
     color: {TEXT_MUTED};
 }}
+
+/* 热键框：冲突时整框标红（2026-11-13）。用动态属性而不是内联样式，
+   这样清空/换热键套时只要 unpolish/polish 一下就能复位。 */
+QLineEdit[hotkeyConflict="true"] {{
+    border: 1px solid {DANGER};
+    background: {DANGER_LIGHT};
+    color: {DANGER};
+}}
+
+/* 热键框右侧的「清空」小按钮：**常显**（用户要求，别改成悬停才出现），
+   空值时置灰不可点——13 个框都留着位置，但只有真正有键的那几个是深色。 */
+QToolButton#HotkeyClear {{
+    border: none;
+    background: transparent;
+    color: {TEXT_MUTED};
+    font-size: 13px;
+    font-weight: 600;
+    padding: 0px;
+}}
+QToolButton#HotkeyClear:disabled {{
+    background: transparent;
+    color: {BORDER_STRONG};
+}}
+QToolButton#HotkeyClear:hover {{
+    background: {HOVER_BG};
+    border-radius: 9px;
+    color: {DANGER};
+}}
+QToolButton#HotkeyClear:pressed {{
+    background: {DANGER_LIGHT};
+    color: {DANGER_HOVER};
+}}
 QComboBox::drop-down {{
     border: none;
     width: 20px;

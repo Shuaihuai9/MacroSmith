@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QScrollArea,
                                QVBoxLayout, QWidget)
 
-from core.config import DEFAULT_HOTKEYS, QUICK_PASSWORD_SLOTS
+from core.config import QUICK_PASSWORD_SLOTS
 from ui import styles
 from ui.settings import HotkeyEdit
 from ui.spin_box import NumberField
@@ -54,6 +54,8 @@ class QuickInputPage(QWidget):
     #: 总开关被勾选/取消：**立即生效并落盘**，不必等保存按钮
     #: （否则「我明明开了，重启又关了」是必然发生的困惑）
     enabled_toggled = Signal(bool)
+    #: 某个热键框被改了（动作名）：主窗口据此在第一次改键时另存为新热键套
+    hotkey_edited = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -61,7 +63,7 @@ class QuickInputPage(QWidget):
         self._pwd_edits: dict[str, QLineEdit] = {}
         #: 密码槽 -> 「显示 / 隐藏」按钮
         self._eye_buttons: dict[str, QPushButton] = {}
-        #: 热键框（``quick_pwd_1..3``）；只有这三条属于本页
+        #: 热键框（``quick_paste`` + ``quick_pwd_1..3``），四条都属于本页
         self._edits: dict[str, HotkeyEdit] = {}
 
         outer = QVBoxLayout(self)
@@ -124,7 +126,7 @@ class QuickInputPage(QWidget):
         box.setContentsMargins(10, 8, 10, 8)
         box.setSpacing(8)
 
-        self.chk_enabled = QCheckBox("启用快捷输入（F1–F4 由宏匠接管）")
+        self.chk_enabled = QCheckBox("启用快捷输入")
         self.chk_enabled.setToolTip(
             "按下热键时，把文本逐字符「敲」进当前获得焦点的输入框。\n"
             "走模拟键盘输入（SendInput），不经过剪贴板。\n\n"
@@ -136,7 +138,7 @@ class QuickInputPage(QWidget):
 
         self.lbl_first_run = QLabel(
             "首次使用请先勾选上面的开关：勾选即生效、并一直保持。"
-            "没勾选时 F1–F4 完全是普通按键，宏匠不会占用它们。")
+            "没勾选时这里设的键完全是普通按键，宏匠不会占用它们。")
         self.lbl_first_run.setObjectName("Hint")
         self.lbl_first_run.setWordWrap(True)
         box.addWidget(self.lbl_first_run)
@@ -161,14 +163,26 @@ class QuickInputPage(QWidget):
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
-        self.chk_paste = QCheckBox("F1 敲入剪贴板内容")
+        self.chk_paste = QCheckBox("敲入剪贴板内容")
         self.chk_paste.setToolTip(
             "读取系统剪贴板里的文本，逐字符敲进当前焦点窗口。\n"
             "好处是不改动、不消耗剪贴板，也不需要目标程序支持粘贴。")
         lay.addWidget(self.chk_paste)
-        key = QLabel("热键固定为 F1")
-        key.setObjectName("Muted")
-        lay.addWidget(key)
+        # 勾掉「敲剪贴板」后它就不占键了，总开关文案要跟着变
+        self.chk_paste.toggled.connect(lambda _checked: self.refresh_hotkey_summary())
+
+        # ★ 剪贴板键**不再是固定 F1**（用户 2026-11-13 要求）：
+        # 它和三个密码槽一样可改，留空 = 这个功能没有热键。
+        self.edit_paste = HotkeyEdit("", row)
+        self.edit_paste.setToolTip("敲入剪贴板的热键（点击后按键即改；留空则该功能不用热键）")
+        self.edit_paste.key_captured.connect(
+            lambda _token: self.hotkey_edited.emit("quick_paste"))
+        self._edits["quick_paste"] = self.edit_paste
+
+        hint = QLabel("热键")
+        hint.setObjectName("Muted")
+        lay.addWidget(hint)
+        lay.addWidget(self.edit_paste)
         lay.addStretch(1)
         box.addWidget(row)
         return group
@@ -222,8 +236,10 @@ class QuickInputPage(QWidget):
         self._eye_buttons[slot] = eye
         layout.addWidget(eye)
 
-        hotkey = HotkeyEdit(DEFAULT_HOTKEYS[f"quick_pwd_{index}"], row)
-        hotkey.setToolTip(f"敲入密码 {index} 的热键（默认 F{index + 1}），点击后按键即可改")
+        hotkey = HotkeyEdit("", row)
+        hotkey.setToolTip(f"敲入密码 {index} 的热键，点击后按键即可改；留空则该槽不用热键")
+        hotkey.key_captured.connect(
+            lambda _token, a=f"quick_pwd_{index}": self.hotkey_edited.emit(a))
         self._edits[f"quick_pwd_{index}"] = hotkey
         hint = QLabel("热键")
         hint.setObjectName("Muted")
@@ -315,8 +331,24 @@ class QuickInputPage(QWidget):
 
     def _refresh_state(self) -> None:
         on = self.chk_enabled.isChecked()
-        self.lbl_state.setText("当前：已启用" if on else "当前：已关闭（F1–F4 未被占用）")
+        self.lbl_state.setText("当前：已启用" if on else "当前：已关闭（这里设的键未被占用）")
         self.lbl_first_run.setVisible(not on)
+        self.refresh_hotkey_summary()
+
+    def refresh_hotkey_summary(self) -> None:
+        """把「总开关」文案换成**当前实际绑定的键**。
+
+        以前这里写死「F1–F4 由宏匠接管」：用户把键改成别的之后，这句话就成了
+        假话——而且它是页面上最显眼的一句，误导性最强。
+        """
+        keys = [edit.text() for action, edit in self._edits.items()
+                if edit.token() and (action != "quick_paste"
+                                     or self.chk_paste.isChecked())]
+        if keys:
+            self.chk_enabled.setText(
+                f"启用快捷输入（{' / '.join(keys)} 由宏匠接管）")
+        else:
+            self.chk_enabled.setText("启用快捷输入（尚未设置热键）")
 
     # ==================================================================
     # 读写
@@ -356,8 +388,37 @@ class QuickInputPage(QWidget):
         self._refresh_state()
 
     def load_hotkeys(self, hotkeys: dict[str, str]) -> None:
-        """只更新三个热键框（保存后同步用）。"""
+        """只更新**传进来的**那几个热键框（保存后两页互相同步用）。
+
+        注意不要改成「没传的清空」：设置页保存时只会传它那 9 个动作，
+        清空会把用户刚填的密码槽热键一起抹掉。
+        """
         for action, token in hotkeys.items():
             edit = self._edits.get(action)
             if edit is not None:
                 edit.set_token(token)
+        self.refresh_hotkey_summary()
+
+    def apply_hotkeys(self, hotkeys: dict[str, str]) -> None:
+        """整体替换（换热键套用）：没出现在 map 里的框一律清空。"""
+        for action, edit in self._edits.items():
+            edit.set_token(hotkeys.get(action, ""))
+        self.refresh_hotkey_summary()
+
+    def active_hotkeys(self) -> dict[str, str]:
+        """本页当前真正绑了键的动作。
+
+        剪贴板那条如果被复选框关掉了就不算——它不会被注册，也就谈不上冲突。
+        """
+        out: dict[str, str] = {}
+        for action, edit in self._edits.items():
+            if action == "quick_paste" and not self.chk_paste.isChecked():
+                continue
+            if edit.token():
+                out[action] = edit.token()
+        return out
+
+    def mark_conflicts(self, conflicts: dict[str, str]) -> None:
+        """把「动作名 -> 冲突说明」画到对应输入框上。"""
+        for action, edit in self._edits.items():
+            edit.set_conflict(conflicts.get(action, ""))

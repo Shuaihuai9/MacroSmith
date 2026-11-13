@@ -33,6 +33,7 @@ from core.config import (Config, DEFAULT_HOTKEYS, HOTKEY_LABELS,
                          QUICK_HOTKEY_ACTIONS, QUICK_HOTKEY_LABELS,
                          QUICK_PASSWORD_SLOTS)
 from core.hotkey_manager import HotkeyManager, display_name, key_to_vk, parse_key
+from core.hotkey_sets import delete_set, find_set, suggest_name, USER_PREFIX
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import DEFAULT_IGNORED_KEYS, Recorder
 from core.poll_recorder import PollRecorder
@@ -196,7 +197,9 @@ class MainWindow(WindowShell):
         self._connect_signals()
         self._apply_options_from_config()
         self._restore_window_geometry()
+        self._refresh_profile_combo()     # 热键套下拉：必须在建好界面之后
         self._register_hotkeys()
+        self._refresh_hotkey_conflicts(notify=False)
         self._refresh_status()
         self._set_state(State.IDLE)
         self.refresh_script_library()
@@ -473,8 +476,12 @@ class MainWindow(WindowShell):
             "· 模式一 原速回放：按录制时的间隔重现全部操作，支持暂停与停止",
             "· 模式二 单步热键：按操作单元逐步执行，PageUp/PageDown 控制进度",
             "· 回放期间程序注入的事件会被自动忽略，不会二次录制",
-            "· 快捷输入：按 F1–F4 把一段文本逐字符「敲」进当前输入框，不走剪贴板，"
-            "密码框 / 远程桌面 / 禁止粘贴的输入框都能用（默认关闭，需手动开启）",
+            "· 热键套：出厂**不占用任何按键**，在「设置 → 热键套」里选一套现成的"
+            "（随软件附带「标准套」），或直接改某个键——第一次改键会自动另存为"
+            "一个新的热键套文件，之后随时切回",
+            "· 快捷输入：按热键把一段文本逐字符「敲」进当前输入框，不走剪贴板，"
+            "密码框 / 远程桌面 / 禁止粘贴的输入框都能用（默认关闭，需手动开启；"
+            "热键可自定义，留空则该功能不占键）",
             "· 快捷密码：三个槽各配一个热键，密码经 DPAPI + 附加熵加密保存在本机，"
             "只有宏匠能解出明文",
         ]
@@ -577,12 +584,18 @@ class MainWindow(WindowShell):
 
         # 设置页
         self.page_settings.hotkeys_saved.connect(self._save_hotkeys)
+        self.page_settings.hotkeys_reload.connect(self._reload_hotkeys_from_config)
+        self.page_settings.hotkey_edited.connect(self._on_hotkey_edited)
+        self.page_settings.hotkey_profile_changed.connect(self._apply_hotkey_profile)
+        self.page_settings.hotkey_profile_save_as.connect(self._save_profile_as)
+        self.page_settings.hotkey_profile_delete.connect(self._delete_profile)
         self.page_settings.options_saved.connect(self._save_options)
         self.page_settings.exclusive_toggled.connect(self._on_exclusive_toggled)
         self.page_settings.merge_changed.connect(self._on_merge_changed)
         # 快捷输入页：保存（含密码/通道/热键）与总开关（立即生效）
         self.page_quick.save_requested.connect(self._save_quick_page)
         self.page_quick.enabled_toggled.connect(self._on_quick_enabled_toggled)
+        self.page_quick.hotkey_edited.connect(self._on_hotkey_edited)
 
         # 跨线程信号（Qt 会按 AutoConnection 自动排队到主线程执行）
         self.sig_recorded.connect(self._on_recorded_on_ui)
@@ -660,6 +673,7 @@ class MainWindow(WindowShell):
                 "热键可用，但按键仍会传给前台程序。"
             )
         self._refresh_hotkey_hint()
+        self._refresh_sidebar_hints()
 
     @staticmethod
     def _hotkey_name(action: str) -> str:
@@ -989,9 +1003,9 @@ class MainWindow(WindowShell):
             else:
                 self._set_message(
                     "快捷输入已保存，但还没有可用的热键：请填一段密码，"
-                    "或勾选「F1 敲入剪贴板内容」。")
+                    "或给「剪贴板」那一条设一个热键。")
         else:
-            self._set_message("快捷输入已关闭（热键已释放，F1–F4 不再被占用）。")
+            self._set_message("快捷输入已关闭（热键已释放，不再占用任何按键）。")
 
     def _on_quick_enabled_toggled(self, enabled: bool) -> None:
         """总开关**立即生效并落盘**，不等「保存」按钮。
@@ -1004,7 +1018,7 @@ class MainWindow(WindowShell):
         self._register_hotkeys()
         # ★ 不要在这里 load_from_config：那会把用户正在输入的密码清空
         if not enabled:
-            self._set_message("快捷输入已关闭：F1–F4 恢复成普通按键。")
+            self._set_message("快捷输入已关闭：相关按键恢复成普通按键。")
             return
         active = list(self.config.quick_hotkey_bindings())
         if active:
@@ -1016,7 +1030,7 @@ class MainWindow(WindowShell):
             # 开着但一条热键都没注册：必须说清楚为什么，否则用户以为功能坏了
             self._set_message(
                 "快捷输入已启用，但还没有可用的热键：请填一段密码，"
-                "或勾选「F1 敲入剪贴板内容」后保存。")
+                "或给「剪贴板」设一个热键后保存。")
 
     def start_recording(self, append: bool = False) -> None:
         """开始录制。
@@ -2280,7 +2294,10 @@ class MainWindow(WindowShell):
         :meth:`_register_hotkeys`——一次保存重挂两遍会留下两个钩子，
         同一个键就会触发两次。
         """
-        parsed = {action: parse_key(token) for action, token in hotkeys.items()}
+        # ★ 空串 = 「这个功能不设热键」，是合法状态（出厂全都是空），
+        #   必须先从校验里剔除；以前每个动作都有默认键，从来没出现过空值。
+        active = {a: t for a, t in hotkeys.items() if (t or "").strip()}
+        parsed = {action: parse_key(token) for action, token in active.items()}
         bad = [action for action, key in parsed.items() if key is None]
         if bad:
             names = "、".join(self._hotkey_name(a) for a in bad)
@@ -2299,21 +2316,177 @@ class MainWindow(WindowShell):
                 + f"  →  {display_name(hotkeys[actions[0]])}"
                 for actions in duplicates.values()
             )
+            self._refresh_hotkey_conflicts(notify=False)   # 让冲突的框一直红着
             QMessageBox.warning(self, "热键重复",
                                 f"以下动作使用了相同的按键：\n{detail}\n\n请改成不同的按键。")
             return False
 
         for action, token in hotkeys.items():
             self.config.set_hotkey(action, token)
+        # ★ 第一次改键 → 自动落成一个新的热键套文件（内置套永不改写）。
+        #   已经是用户套时，这里等于把改动写回那个套。
+        created = self.config.ensure_custom_profile()
         self.config.save()
+        if created is not None:
+            log.info("已自动新建热键套「%s」（%d 个键）", created.name, created.count)
         # 两页各有一部分热键框，都要同步（只更新存在的那些）
         self.page_settings.load_hotkeys(hotkeys)
         self.page_quick.load_hotkeys(hotkeys)
+        self._refresh_profile_combo()
+        self._refresh_hotkey_conflicts(notify=False)
         if register:
             self._register_hotkeys()
-            self._set_message("热键已更新并重新注册。")
+            if created is not None:
+                self._set_message(
+                    f"热键已保存，并自动新建热键套「{created.name}」"
+                    f"（{created.count} 个键）。")
+            else:
+                self._set_message("热键已更新并重新注册。")
             self._refresh_status()
         return True
+
+    # ==================================================================
+    # 热键套（一整套绑定的切换 / 另存 / 删除）
+    # ==================================================================
+    def _refresh_profile_combo(self) -> None:
+        """把磁盘上的套列表与当前选择同步到设置页下拉框。"""
+        self.page_settings.load_profiles(self.config.hotkey_sets(),
+                                         self.config.hotkey_profile)
+
+    def _sync_hotkey_pages(self, bindings: dict[str, str]) -> None:
+        """把一份绑定整体灌进两个页面的热键框（换热键套/撤销时用）。"""
+        self.page_settings.apply_hotkeys(bindings)
+        self.page_quick.apply_hotkeys(bindings)
+        self._refresh_hotkey_conflicts(notify=False)
+
+    def _refresh_hotkey_conflicts(self, notify: bool = True) -> bool:
+        """即时查重：同一个键被两个功能占用时整框标红 + 提示。
+
+        保存时还有一道硬拦截（``_save_hotkeys`` 里那道 ``QMessageBox``），
+        但那只在点了保存之后才知道。用户在框里**按下键的那一刻**就该看到
+        「F6 已经被『开始回放』用了」，否则他要改两次才发现。
+
+        查的是**两个页面当前显示的**值（含未保存的改动），不是配置里的值。
+        """
+        bindings: dict[str, str] = {}
+        bindings.update(self.page_settings.active_hotkeys())
+        bindings.update(self.page_quick.active_hotkeys())
+
+        groups: dict[str, list[str]] = {}
+        for action, token in bindings.items():
+            groups.setdefault(token, []).append(action)
+        dupes = {token: actions for token, actions in groups.items()
+                 if len(actions) > 1}
+
+        conflicts: dict[str, str] = {}
+        for token, actions in dupes.items():
+            shown = display_name(token)
+            for action in actions:
+                others = "、".join(
+                    f"「{self._hotkey_name(a)}」" for a in actions if a != action)
+                conflicts[action] = (
+                    f"{shown} 同时绑给了 {others}，改掉其中一个或清空一个")
+        self.page_settings.mark_conflicts(conflicts)
+        self.page_quick.mark_conflicts(conflicts)
+
+        if dupes and notify:
+            token, actions = next(iter(dupes.items()))
+            names = "、".join(f"「{self._hotkey_name(a)}」" for a in actions)
+            self._set_message(
+                f"热键冲突：{display_name(token)} 同时绑给了 {names}，"
+                "请改掉其中一个，或点输入框右侧的 × 清空。")
+        return bool(dupes)
+
+    def _on_hotkey_edited(self, action: str) -> None:
+        """某个热键框被改：先只提示，等「保存」时再落盘并另存为套。
+
+        这里**不能**立刻存盘：用户可能连改好几个键才保存，逐个存盘会造出
+        一堆半成品套文件。
+        """
+        log.info("热键被修改：%s（等保存）", action)
+        if self._refresh_hotkey_conflicts(notify=True):
+            return          # 状态栏已经在说冲突了，别用「记得保存」把它盖掉
+        self._set_message(
+            "热键已修改，点「保存设置」后生效——"
+            "第一次改键会自动另存成一个新的热键套，内置套不会被改动。")
+
+    def _reload_hotkeys_from_config(self) -> None:
+        """「撤销热键改动」：把两页的热键框恢复成配置里的样子（不写盘）。"""
+        self._sync_hotkey_pages(self.config.hotkeys)
+        self._refresh_profile_combo()
+        self._set_message("已撤销未保存的热键改动。")
+
+    def _apply_hotkey_profile(self, key: str) -> None:
+        """换一套热键：整体替换绑定 → 落盘 → 重挂 → 同步两个页面。"""
+        if key == self.config.hotkey_profile:
+            return
+        if not key:
+            self.config.clear_hotkeys()
+            name = ""
+        else:
+            item = find_set(self.config.path, key)
+            if item is None:
+                log.warning("热键套 %s 已不存在，忽略本次切换", key)
+                self._refresh_profile_combo()
+                return
+            self.config.apply_hotkey_set(item)
+            name = item.name
+        self.config.save()
+        bindings = self.config.hotkeys
+        self._sync_hotkey_pages(bindings)
+        self._register_hotkeys()
+        self._refresh_profile_combo()
+        if bindings:
+            self._set_message(f"已启用热键套「{name}」：{len(bindings)} 个键已生效。")
+        else:
+            self._set_message("已停用全部热键：各功能仍可点按钮操作。")
+
+    def _save_profile_as(self) -> None:
+        """把当前这些按键另存为一个新的用户套。"""
+        existing = {item.name for item in self.config.hotkey_sets()
+                    if not item.builtin}
+        name = ask_name(
+            "另存为热键套",
+            "给这套热键起个名字，以后可以在「热键套」下拉里一键切回来。",
+            initial=suggest_name(self.config.path),
+            hint="文件写在配置目录旁边的 hotkey_sets 文件夹里，可以拷给别人用。",
+            existing=existing, parent=self)
+        if not name:
+            return
+        item = self.config.save_hotkeys_as_set(name)
+        if item is None:
+            self._set_message("热键套保存失败，请检查配置目录是否可写。")
+            return
+        self.config.save()
+        self._sync_hotkey_pages(self.config.hotkeys)
+        self._register_hotkeys()
+        self._refresh_profile_combo()
+        self._set_message(f"已另存为热键套「{item.name}」（{item.count} 个键）。")
+
+    def _delete_profile(self) -> None:
+        """删除当前的用户套（内置套不可删）。删完顺便清空绑定。"""
+        key = self.config.hotkey_profile
+        if not key.startswith(USER_PREFIX):
+            self._set_message("内置的「标准套」不能删除，只能改用它或另存一套。")
+            return
+        item = find_set(self.config.path, key)
+        if item is None:
+            self._refresh_profile_combo()
+            return
+        if ask_question(
+                self, "删除热键套",
+                f"确定删除热键套「{item.name}」吗？\n\n"
+                "只删这一个套文件；当前生效的热键会一并清空"
+                "（之后可以选别的套，或自己重新设键）。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        delete_set(self.config.path, key)
+        self.config.clear_hotkeys()
+        self.config.save()
+        self._sync_hotkey_pages({})
+        self._register_hotkeys()
+        self._refresh_profile_combo()
+        self._set_message(f"已删除热键套「{item.name}」，热键已清空。")
 
     def _save_options(self, options: dict[str, Any]) -> None:
         """保存录制/回放选项（设置页入口）。"""
@@ -2639,41 +2812,87 @@ class MainWindow(WindowShell):
         self._refresh_hotkey_hint()
 
     def _refresh_hotkey_hint(self) -> None:
-        """按当前状态拼出底部灰色热键提示。"""
+        """按当前状态拼出底部灰色热键提示。
+
+        ★ 出厂一个键都不绑，所以每一项都得容忍「空」：没绑的动作直接不显示，
+        全都为空时改口提示去设置页挑一套——不能再像以前那样把动作名当成
+        按键名印上去（``record_start 开始录制`` 这种）。
+        """
         def key(action: str) -> str:
-            return self.hotkeys.binding_display(action) or action
+            return (self.hotkeys.binding_display(action)
+                    or display_name(self.config.hotkey(action)))
+
+        def part(action: str, label: str) -> str:
+            token = key(action)
+            return f"{token} {label}" if token else ""
 
         parts: list[str] = []
         if self.state is State.RECORDING:
-            parts.append(f"{key('record_pause')} 暂停录制")
-            parts.append(f"{key('record_stop')} 停止录制")
+            parts.append(part("record_pause", "暂停录制"))
+            parts.append(part("record_stop", "停止录制"))
         elif self.state is State.RECORD_PAUSED:
-            parts.append(f"{key('record_pause')} 继续录制")
-            parts.append(f"{key('record_stop')} 停止录制")
+            parts.append(part("record_pause", "继续录制"))
+            parts.append(part("record_stop", "停止录制"))
         elif self.state in (State.REPLAYING, State.PAUSED):
-            parts.append(f"{key('play_toggle')} 暂停/继续")
-            parts.append(f"{key('play_stop')} 停止回放")
+            parts.append(part("play_toggle", "暂停/继续"))
+            parts.append(part("play_stop", "停止回放"))
         elif self.mode_combo.currentData() == MODE_STEP:
-            parts.append(f"{key('step_next')} 下一步")
-            parts.append(f"{key('step_prev')} 上一步")
-            parts.append(f"{key('step_reset')} 重置指针")
+            parts.append(part("step_next", "下一步"))
+            parts.append(part("step_prev", "上一步"))
+            parts.append(part("step_reset", "重置指针"))
         else:
             # 空闲态：只列「现在按了就有效」的键。停止录制在这里按了没有意义，
             # 所以挪到录制态那两支里显示。
-            parts.append(f"{key('record_start')} 开始录制")
-            parts.append(f"{key('play_toggle')} 开始回放")
-            parts.append(f"{key('pause_toggle')} 暂停/继续")
-            parts.append(f"{key('play_stop')} 停止回放")
-            parts.append(f"{key('step_next')}/{key('step_prev')} 单步")
+            parts.append(part("record_start", "开始录制"))
+            parts.append(part("play_toggle", "开始回放"))
+            parts.append(part("pause_toggle", "暂停/继续"))
+            parts.append(part("play_stop", "停止回放"))
+            steps = [key(a) for a in ("step_next", "step_prev") if key(a)]
+            if steps:
+                parts.append(f"{'/'.join(steps)} 单步")
             quick = self.config.quick_hotkey_bindings()
             if quick:
                 names = "/".join(key(action) for action in QUICK_HOTKEY_ACTIONS
                                  if action in quick)
                 parts.append(f"{names} 快捷输入")
-        text = "　·　".join(parts)
+        parts = [item for item in parts if item]
+        text = "　·　".join(parts) if parts else "尚未设置（到「设置 → 热键套」选一套）"
         if self._hotkey_failures:
             text += "　⚠ 部分热键注册失败，请到设置页修改"
         self.hotkey_label.setText(f"热键：{text}")
+
+    def _refresh_sidebar_hints(self) -> None:
+        """侧边栏提示语跟随**当前绑定**，并且功能说明在前、热键在后。
+
+        用户的抱怨（2026-11-13）：「鼠标指针停到 tab 上面提示也是热键居前」，
+        而且键是写死的——改了键提示还是旧的。现在改成两行：第一行说这一页
+        干什么，第二行才列当前按键；一个键都没绑时明确写「未设置」。
+        """
+        def label(action: str) -> str:
+            token = self.config.hotkey(action)
+            return display_name(token) if token else ""
+
+        def tip(title: str, hint: str, entries: list[str]) -> str:
+            body = " · ".join(entries) if entries else "未设置（功能仍可点按钮使用）"
+            return f"{title}\n{hint}\n\n热键：{body}"
+
+        playback = [f"{label(a)} {t}" for a, t in
+                    (("play_toggle", "开始回放"), ("play_stop", "停止回放"))
+                    if label(a)]
+        record = [f"{label(a)} {t}" for a, t in
+                  (("record_pause", "暂停/继续"), ("record_stop", "停止录制"))
+                  if label(a)]
+        quick = [f"{label(a)} {t}" for a, t in
+                 (("quick_paste", "敲剪贴板"), ("quick_pwd_1", "密码 1"),
+                  ("quick_pwd_2", "密码 2"), ("quick_pwd_3", "密码 3"))
+                 if label(a)]
+
+        self.sidebar.btn_library.setToolTip(tip(
+            "回放与脚本", "选择脚本 · 循环设置 · 开始/停止回放", playback))
+        self.sidebar.btn_record.setToolTip(tip(
+            "录制与步骤编辑", "录制 · 步骤列表 · 插入/编辑/批量操作", record))
+        self.sidebar.btn_quick.setToolTip(tip(
+            "快捷输入", "把一段文本逐字符敲进当前输入框", quick))
 
     def _set_message(self, text: str) -> None:
         """更新状态栏消息。"""

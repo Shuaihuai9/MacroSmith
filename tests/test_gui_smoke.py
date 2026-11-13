@@ -34,6 +34,7 @@ from core import event_parser as ep                              # noqa: E402
 from core import quick_input as qi                               # noqa: E402
 from core.config import DEFAULT_HOTKEYS, Config                   # noqa: E402
 from core.hotkey_hook import hook_supported                       # noqa: E402
+from core.hotkey_sets import STANDARD_KEY, find_set, sets_dir      # noqa: E402
 from core.player import MODE_STEP, MODE_TIMED                    # noqa: E402
 from ui import styles                                            # noqa: E402
 from ui.main_window import (PAGE_ABOUT, PAGE_LIBRARY, PAGE_RECORD,   # noqa: E402
@@ -4672,3 +4673,296 @@ class TestQuickInputRecorderPollution:
         for inp in seen:
             assert inp.type == win_input.INPUT_KEYBOARD
             assert inp.ki.wVk == 0
+
+
+# ===========================================================================
+# 2026-11-13：热键套（出厂不绑键 / 选套 / 改键自动另存 / 提示语跟随）
+# ===========================================================================
+class TestHotkeyProfileGUI:
+    """「热键套」在界面上的行为。
+
+    这一组**不能**用 ``window`` 夹具：那个夹具会先把 13 个默认热键全写进配置，
+    而本功能要验的正是「出厂一个键都不绑」的初始状态。
+    """
+
+    @pytest.fixture()
+    def fresh(self, qapp, monkeypatch, tmp_path):
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr("ui.main_window.ask_question",
+                            staticmethod(lambda *a, **k: QMessageBox.Yes))
+        cfg = Config(tmp_path / "config.json")
+        cfg.set("scripts_dir", str(tmp_path / "scripts"))
+        cfg.save()
+        win = MainWindow(cfg)
+        win.show()
+        _pump(qapp, 60)
+        yield win
+        win.close()
+        _pump(qapp, 30)
+
+    def test_factory_state_binds_nothing(self, fresh):
+        """出厂：一个键都不绑，下拉停在「未设置」，侧边栏不提任何键。"""
+        assert fresh.config.hotkeys == {}
+        assert fresh.config.hotkey_profile == ""
+        combo = fresh.page_settings.combo_profile
+        assert combo.currentData() == ""
+        for action, edit in fresh.page_settings._edits.items():
+            assert edit.token() == "", f"{action} 出厂不该绑键"
+        assert "尚未设置" in fresh.hotkey_label.text()
+        assert "未设置" in fresh.sidebar.btn_record.toolTip()
+
+    def test_select_standard_profile_registers_keys(self, fresh, qapp):
+        """选中「标准套」→ 13 个键立刻生效，提示语跟着换成真实按键。"""
+        combo = fresh.page_settings.combo_profile
+        combo.setCurrentIndex(combo.findData(STANDARD_KEY))
+        _pump(qapp, 80)
+
+        assert fresh.config.hotkey_profile == STANDARD_KEY
+        assert len(fresh.config.hotkeys) == 13
+        assert fresh.config.hotkey("record_stop") == "f9"
+        # 注册表里有这些键（热键真的挂上了，不只是写进配置）
+        assert fresh.hotkeys.binding_display("record_stop") == "F9"
+        # 侧边栏：功能说明在前，热键在后，且是当前绑定
+        record_tip = fresh.sidebar.btn_record.toolTip()
+        assert record_tip.splitlines()[0].startswith("录制与步骤编辑")
+        assert "F9 停止录制" in record_tip
+        assert "F11" in record_tip
+        quick_tip = fresh.sidebar.btn_quick.toolTip()
+        assert "F1 敲剪贴板" in quick_tip
+
+    def test_back_to_unset_releases_keys(self, fresh, qapp):
+        """再选回「未设置」：键全部释放，回放/录制只剩按钮。"""
+        combo = fresh.page_settings.combo_profile
+        combo.setCurrentIndex(combo.findData(STANDARD_KEY))
+        _pump(qapp, 60)
+        combo.setCurrentIndex(0)
+        _pump(qapp, 60)
+
+        assert fresh.config.hotkeys == {}
+        assert fresh.config.hotkey_profile == ""
+        assert fresh.hotkeys.binding_display("record_stop") == ""
+        assert "未设置" in fresh.sidebar.btn_record.toolTip()
+
+    def test_edit_key_creates_user_set_file(self, fresh, qapp, tmp_path):
+        """改一个键并保存 → 自动新建用户套文件，内置套不被改坏。"""
+        combo = fresh.page_settings.combo_profile
+        combo.setCurrentIndex(combo.findData(STANDARD_KEY))
+        _pump(qapp, 60)
+
+        edit = fresh.page_settings._edits["record_stop"]
+        edit.set_token("f10")
+        fresh.page_settings.btn_save.click()
+        _pump(qapp, 80)
+
+        assert fresh.config.hotkey_profile == "user:我的热键"
+        assert fresh.config.hotkey("record_stop") == "f10"
+        path = sets_dir(fresh.config.path) / "我的热键.json"
+        assert path.exists(), "第一次改键必须落一个套文件"
+        saved = find_set(fresh.config.path, "user:我的热键")
+        assert saved is not None and saved.hotkeys["record_stop"] == "f10"
+        # 内置套原样：标准套仍然是 F9
+        assert find_set(fresh.config.path, STANDARD_KEY).hotkeys["record_stop"] == "f9"
+
+    def test_quick_paste_hotkey_is_editable(self, fresh, qapp):
+        """剪贴板不再固定 F1：可以在快捷输入页改键。"""
+        page = fresh.page_quick
+        assert hasattr(page, "edit_paste")
+        page.edit_paste.set_token("f7")
+        page.btn_save.click()
+        _pump(qapp, 60)
+        assert fresh.config.hotkey("quick_paste") == "f7"
+        # 总开关文案跟着实际按键走，不再写死 F1–F4
+        assert "F7" in page.chk_enabled.text()
+
+
+class TestHotkeyClearAndConflict:
+    """清空热键（× 按钮 / Esc 语义）与即时冲突提示。"""
+
+    @pytest.fixture()
+    def fresh(self, qapp, monkeypatch, tmp_path):
+        monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr(QMessageBox, "information",
+                            staticmethod(lambda *a, **k: None))
+        monkeypatch.setattr("ui.main_window.ask_question",
+                            staticmethod(lambda *a, **k: QMessageBox.Yes))
+        cfg = Config(tmp_path / "config.json")
+        cfg.set("scripts_dir", str(tmp_path / "scripts"))
+        cfg.save()
+        win = MainWindow(cfg)
+        win.show()
+        _pump(qapp, 60)
+        yield win
+        win.close()
+        _pump(qapp, 30)
+
+    def _edit(self, win, action="record_stop"):
+        return win.page_settings._edits[action]
+
+    def test_clear_button_empties_hotkey(self, fresh, qapp):
+        """右侧 × 能把键清空，并且清空按钮随之隐藏。"""
+        edit = self._edit(fresh)
+        edit.set_token("f9")
+        # 用 isHidden 而不是 isVisible：设置页此刻不是当前页，isVisible 恒为 False
+        assert edit._clear_btn.isHidden() is False
+        assert edit._clear_btn.isEnabled() is True
+
+        edit._clear_btn.click()
+        _pump(qapp, 40)
+        assert edit.token() == ""
+        assert edit.text() == ""
+        # × 常显：清空后仍在原位，只是变成不可点的灰态
+        assert edit._clear_btn.isHidden() is False
+        assert edit._clear_btn.isEnabled() is False
+
+        # 清空后保存：这个功能就是「没有热键」，不是被改回默认值
+        fresh.page_settings.btn_save.click()
+        _pump(qapp, 60)
+        assert fresh.config.hotkey("record_stop") == ""
+
+    def test_clear_button_always_visible(self, fresh):
+        """× 常显（用户要求）：空框里也留着，但置灰不可点。"""
+        for edit in fresh.page_settings._edits.values():
+            assert edit._clear_btn.isHidden() is False
+            assert edit._clear_btn.isEnabled() is False
+
+    def test_clear_works_immediately_after_capture(self, fresh, qapp):
+        """空框里抓一个键之后，**不保存**也能立刻点 × 清空。
+
+        这是用户 2026-11-13 报的原症状：「绑定了一个键后想清空该键的话必须
+        先保存一下这才能清空」。根因是 ``keyPressEvent`` 曾经绕过
+        :meth:`HotkeyEdit.set_token` 直接写 ``self._token``，于是 × 的
+        ``setEnabled`` 没跟着更新——键已经显示在框里了，× 却还是灰的。
+        没有「保存」这个动作走一趟 ``load_hotkeys -> set_token`` 就点不动。
+
+        所以这里必须在**真实按键路径**上验（QTest.keyClick，而不是直接
+        ``set_token``），否则绕开了 bug 所在的那一行，测了等于没测。
+        """
+        edit = self._edit(fresh)
+        assert edit.token() == ""
+        assert edit._clear_btn.isEnabled() is False
+
+        edit.setFocus()
+        _pump(qapp, 20)
+        QTest.keyClick(edit, Qt.Key_F9)
+        _pump(qapp, 40)
+
+        assert edit.token() == "f9"
+        assert edit.text() == "F9"
+        # ★ 关键断言：抓完键、还没保存，× 必须已经可点
+        assert edit._clear_btn.isEnabled() is True, "抓到键后 × 应当立刻可用"
+
+        edit._clear_btn.click()
+        _pump(qapp, 40)
+        assert edit.token() == ""
+        assert edit.text() == ""
+        assert edit._clear_btn.isEnabled() is False
+
+    def test_capture_then_clear_from_empty_box(self, fresh, qapp):
+        """出厂空框里连续抓键／清空，每一步 × 状态都对得上（不需要保存）。"""
+        edit = self._edit(fresh, "record_start")
+        for token_key, token, shown in ((Qt.Key_F6, "f6", "F6"),
+                                        (Qt.Key_PageDown, "page_down", "PageDown")):
+            QTest.keyClick(edit, token_key)
+            _pump(qapp, 30)
+            assert edit.token() == token
+            assert edit.text() == shown
+            assert edit._clear_btn.isEnabled() is True
+            edit._clear_btn.click()
+            _pump(qapp, 30)
+            assert edit.token() == ""
+            assert edit._clear_btn.isEnabled() is False
+
+    def test_named_keys_are_capturable(self, fresh, qapp):
+        """PageUp / PageDown / Insert / Delete / 小键盘 Enter 都要抓得进来。
+
+        这五个键曾经**完全按不出值**：``_QT_KEY_FALLBACK`` 只写了 pynput 风格的
+        ``pgup/pgdown/ins/del/return``，而 Qt 的真实枚举名是
+        ``Key_PageUp/Key_PageDown/Key_Insert/Key_Delete/Key_Enter``，查不到映射就
+        退回去取 ``event.text()``，这些键没有文本 -> 返回空串 -> 框里毫无反应。
+        标准套里的 ``step_next`` 正是 PageDown，用户连改它都改不了。
+        """
+        edit = self._edit(fresh, "record_stop")
+        cases = [
+            (Qt.Key_PageDown, "page_down", "PageDown"),
+            (Qt.Key_PageUp, "page_up", "PageUp"),
+            (Qt.Key_Insert, "insert", "Insert"),
+            (Qt.Key_Delete, "delete", "Delete"),
+            (Qt.Key_Enter, "enter", "Enter"),
+        ]
+        for token_key, token, shown in cases:
+            edit.set_token("")
+            QTest.keyClick(edit, token_key)
+            _pump(qapp, 30)
+            assert edit.token() == token, f"{shown} 抓不进来（拿到了 {edit.text()!r}）"
+            assert edit.text() == shown
+            assert edit._clear_btn.isEnabled() is True
+
+    def test_escape_keeps_value(self, fresh, qapp):
+        """Esc 只是退出录入状态，不该把已有热键清掉。"""
+        edit = self._edit(fresh)
+        edit.set_token("f9")
+        edit.setFocus()
+        _pump(qapp, 20)
+        QTest.keyClick(edit, Qt.Key_Escape)
+        _pump(qapp, 20)
+        assert edit.token() == "f9"
+
+    def test_conflict_marks_both_boxes(self, fresh, qapp):
+        """两个功能绑同一个键：两个框都标红，状态栏点名冲突。"""
+        first = self._edit(fresh, "record_stop")
+        second = self._edit(fresh, "play_stop")
+        first.set_token("f9")
+        first.key_captured.emit("f9")
+        second.set_token("f9")
+        second.key_captured.emit("f9")
+        _pump(qapp, 40)
+
+        assert first.conflict and second.conflict
+        assert first.property("hotkeyConflict") is True
+        assert "record" not in first.conflict      # 用的是给人看的名字，不是动作名
+        assert "停止录制" in second.conflict or "停止回放" in second.conflict
+        assert "热键冲突" in fresh.message_label.text()
+
+    def test_conflict_clears_when_fixed(self, fresh, qapp):
+        """把其中一个改掉，红框和提示都要消失。"""
+        first = self._edit(fresh, "record_stop")
+        second = self._edit(fresh, "play_stop")
+        for edit in (first, second):
+            edit.set_token("f9")
+            edit.key_captured.emit("f9")
+        _pump(qapp, 40)
+        assert first.conflict
+
+        second.set_token("f8")
+        second.key_captured.emit("f8")
+        _pump(qapp, 40)
+        assert first.conflict == ""
+        assert second.conflict == ""
+        assert first.property("hotkeyConflict") is False
+        assert "热键冲突" not in fresh.message_label.text()
+
+    def test_conflict_spans_both_pages(self, fresh, qapp):
+        """设置页 9 个 + 快捷输入页 4 个，跨页也要查出来。"""
+        edit = self._edit(fresh, "record_stop")
+        edit.set_token("f9")
+        edit.key_captured.emit("f9")
+        quick = fresh.page_quick._edits["quick_pwd_1"]
+        quick.set_token("f9")
+        quick.key_captured.emit("f9")
+        _pump(qapp, 40)
+
+        assert edit.conflict and quick.conflict
+        assert "快捷密码 1" in edit.conflict
+
+
+class TestHotkeySetNameDialog:
+    """另存为热键套：名字清洗与覆盖判断复用脚本命名弹窗。"""
+
+    def test_slugify_keeps_chinese_and_strips_illegal(self):
+        from core.hotkey_sets import slugify
+
+        assert slugify("我的热键") == "我的热键"
+        assert slugify('a/b:c*?"') == "a_b_c___"
+        assert slugify("   ") == ""

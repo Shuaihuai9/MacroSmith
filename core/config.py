@@ -6,12 +6,17 @@
 配置结构（节选）::
 
     {
-      "hotkeys": {"record_start": "f12", "record_stop": "f9", "play_toggle": "f6", ...},
+      "hotkey_profile": "builtin:standard",   # 当前启用的「热键套」，空串 = 一个键都不绑
+      "hotkeys": {"record_start": "f12", "record_stop": "f9", ...},
       "window":  {"x": null, "y": null, "width": 1000, "height": 700},
       "player":  {"default_mode": "timed", "speed": 1.0, ...},
       "scripts_dir": "data/scripts",
       "last_script": null
     }
+
+★ ``hotkeys`` 是**当前生效**的绑定，出厂是空字典（一个键都不占）。
+用户从「热键套」下拉里选一套、或者自己改某个键，才会往里写东西；
+套文件本身放在 ``<config 同目录>/hotkey_sets/`` 下，见 :mod:`core.hotkey_sets`。
 """
 
 from __future__ import annotations
@@ -24,6 +29,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from utils.win_utils import app_data_dir, is_frozen, project_root
+from core.hotkey_sets import (HotkeySet, STANDARD_HOTKEYS, find_set,
+                              list_sets, sanitize_bindings, save_set,
+                              suggest_name)
 
 #: 默认窗口尺寸（第五阶段从 900x600 提到 1000x700）
 DEFAULT_WINDOW_WIDTH = 1000
@@ -37,23 +45,10 @@ _LEGACY_DEFAULT_SIZES: tuple[tuple[int, int], ...] = (
 
 log = logging.getLogger(__name__)
 
-#: 所有可配置热键的默认值（键名 -> 默认按键）
-DEFAULT_HOTKEYS: dict[str, str] = {
-    "record_start": "f12",   # 开始录制
-    "record_stop": "f9",     # 停止录制
-    "record_pause": "f11",   # 暂停/继续录制
-    "play_toggle": "f6",     # 模式一：开始回放
-    "pause_toggle": "f7",    # 模式一：暂停/继续
-    "play_stop": "f8",       # 模式一：停止回放
-    "step_next": "page_down",  # 模式二：下一步
-    "step_prev": "page_up",    # 模式二：上一步
-    "step_reset": "home",      # 模式二：重置指针
-    # 快捷输入（文本模拟打字）：F1 敲剪贴板内容，F2/F3/F4 敲三个密码
-    "quick_paste": "f1",
-    "quick_pwd_1": "f2",
-    "quick_pwd_2": "f3",
-    "quick_pwd_3": "f4",
-}
+#: 「标准套」的按键定义。**不是出厂绑定**——出厂一个键都不绑，
+#: 用户从「热键套」下拉里选中它，这些键才会被注册。
+#: 保留这个名字是因为大量代码与测试拿它当「那套熟悉的热键」的参照。
+DEFAULT_HOTKEYS: dict[str, str] = dict(STANDARD_HOTKEYS)
 
 #: 「快捷输入」专用的热键动作。它们有自己的设置区域（含密码框），
 #: 因此不进 :data:`HOTKEY_LABELS`——否则会混进「全局热键」列表里多出四行。
@@ -77,16 +72,21 @@ HOTKEY_LABELS: dict[str, tuple[str, str]] = {
     "step_reset": ("重置指针（模式二）", "模式二：把步骤指针复位到开头"),
 }
 
-#: 快捷输入热键的界面显示名（注册失败的提示要用）
+#: 快捷输入热键的界面显示名（注册失败 / 冲突的提示要用）。
+#: ★ 名字里**不许再写死按键**：热键已可自定义，写死就会出现「F1 F7 敲入剪贴板」。
 QUICK_HOTKEY_LABELS: dict[str, str] = {
-    "quick_paste": "F1 敲入剪贴板",
+    "quick_paste": "敲入剪贴板",
     "quick_pwd_1": "快捷密码 1",
     "quick_pwd_2": "快捷密码 2",
     "quick_pwd_3": "快捷密码 3",
 }
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "hotkeys": dict(DEFAULT_HOTKEYS),
+    # ★ 出厂不绑任何热键：F1–F12 在别的软件里各有用途，装完就抢键会被当成
+    #   「键盘坏了」。用户选一个「热键套」或自己改某个键之后才会有绑定。
+    "hotkeys": {},
+    #: 当前生效的热键套标识（``builtin:standard`` / ``user:我的热键`` / 空串）
+    "hotkey_profile": "",
     "window": {"x": None, "y": None, "width": DEFAULT_WINDOW_WIDTH,
                "height": DEFAULT_WINDOW_HEIGHT},
     #: 热键独占：运行期间吞掉已注册热键，不再把按键传给前台程序
@@ -242,13 +242,108 @@ class Config:
     # ------------------------------------------------------------------
     @property
     def hotkeys(self) -> dict[str, str]:
-        return dict(self.data.get("hotkeys", {}))
+        """当前生效的绑定（**只含已绑定的动作**：没绑的不会以空串出现）。"""
+        return sanitize_bindings(self.data.get("hotkeys") or {})
 
     def hotkey(self, action: str) -> str:
-        return str(self.get(f"hotkeys.{action}", DEFAULT_HOTKEYS.get(action, "")))
+        """某个动作当前的按键；**没绑定时返回空串**（不再回落到标准套）。"""
+        return str(self.get(f"hotkeys.{action}", "") or "")
 
     def set_hotkey(self, action: str, key: str) -> None:
-        self.set(f"hotkeys.{action}", key)
+        """写入热键；传空串表示「清空这个功能的键」——直接把条目删掉。
+
+        不留下 ``"action": ""`` 这种空壳：空串在读取时会被过滤掉，但写在文件里
+        既难看又容易让人以为「配了但没生效」。
+        """
+        token = (key or "").strip().lower()
+        hk = self.data.setdefault("hotkeys", {})
+        if token:
+            hk[action] = token
+        else:
+            hk.pop(action, None)
+
+    # ------------------------------------------------------------------
+    # 热键套（一套命名好的绑定）
+    # ------------------------------------------------------------------
+    @property
+    def hotkey_profile(self) -> str:
+        """当前生效的套：``builtin:standard`` / ``user:<文件名>`` / 空串。"""
+        return str(self.get("hotkey_profile", "") or "")
+
+    def set_hotkey_profile(self, key: str) -> None:
+        self.set("hotkey_profile", str(key or ""))
+
+    def hotkey_sets(self) -> list[HotkeySet]:
+        """全部可选的套（内置 + 磁盘上的用户套）。"""
+        return list_sets(self.path)
+
+    def current_hotkey_set(self) -> Optional[HotkeySet]:
+        """当前套对象；没选套、或文件已被删掉时返回 ``None``。"""
+        return find_set(self.path, self.hotkey_profile)
+
+    def apply_hotkey_set(self, item: HotkeySet) -> None:
+        """整体换成另一套（覆盖当前绑定并记下 profile，**不落盘**）。"""
+        self.data["hotkeys"] = sanitize_bindings(item.hotkeys)
+        self.set_hotkey_profile(item.key)
+
+    def clear_hotkeys(self) -> None:
+        """不启用任何热键套：一个键都不绑。"""
+        self.data["hotkeys"] = {}
+        self.set_hotkey_profile("")
+
+    def save_hotkeys_as_set(self, name: str) -> Optional[HotkeySet]:
+        """把当前绑定存成一个用户套（同名覆盖），并切到它。"""
+        item = save_set(self.path, name, self.hotkeys)
+        if item is not None:
+            self.set_hotkey_profile(item.key)
+        return item
+
+    def ensure_custom_profile(self) -> Optional[HotkeySet]:
+        """用户改了某个键之后调用：保证改动落在**用户自己的套**里。
+
+        * 绑定和当前套**完全一样**（只是点了保存、没改键）→ 什么都不做。
+          这一条很关键：不加的话，用户随手点一下「保存设置」就会把内置套
+          悄悄复制成「我的热键」，下拉里凭空多一项。
+        * 当前已经是用户套 → 覆盖那个套的文件（返回 ``None``，不算新建）；
+        * 当前是内置套或没选套 → **自动新建**一个套文件（名字 ``我的热键``，
+          重名自动加序号），并把 profile 切过去。
+
+        这样「改了一个键」不会污染内置套，用户下次也能在下拉里找回这一套；
+        而第一次改键就是用户第一次拥有自己的套。
+        """
+        bindings = self.hotkeys
+        current = self.current_hotkey_set()
+        if current is None and not bindings:
+            return None                    # 一个键都没有：没有可存的套
+        if current is not None and bindings == sanitize_bindings(current.hotkeys):
+            return None                    # 没改键
+        if current is not None and not current.builtin:
+            save_set(self.path, current.name, bindings)   # 写回同一个套
+            return None
+        return self.save_hotkeys_as_set(suggest_name(self.path))
+
+    def migrate_hotkey_profile(self) -> bool:
+        """把「有绑定但没有套」的老配置迁移成用户套（返回是否发生了迁移）。
+
+        1.2.0 及之前每个动作都有出厂键，配置文件里躺着一整套绑定却没有
+        ``hotkey_profile``。不迁移的话，用户升级后下拉框显示「未设置」，
+        但他改过的键其实还在生效——界面和现实对不上。这里把它们原样存成
+        「我的热键」套，profile 指向它，界面与现实立刻一致。
+        """
+        current = self.hotkey_profile
+        if current and find_set(self.path, current) is not None:
+            return False
+        if current:
+            log.warning("配置里的热键套 %s 已不存在，按现有绑定重建", current)
+            self.set_hotkey_profile("")
+        if not self.hotkeys:
+            return False
+        item = self.save_hotkeys_as_set(suggest_name(self.path))
+        if item is None:
+            return False
+        log.info("已把现有热键绑定另存为热键套「%s」（%d 个键）",
+                 item.name, item.count)
+        return True
 
     @property
     def hotkey_exclusive(self) -> bool:
@@ -372,11 +467,12 @@ class Config:
         if not self.quick_input_enabled:
             return {}
         out: dict[str, str] = {}
-        if self.quick_paste_enabled:
+        if self.quick_paste_enabled and self.hotkey("quick_paste"):
             out["quick_paste"] = self.hotkey("quick_paste")
         for index, slot in enumerate(QUICK_PASSWORD_SLOTS, start=1):
-            if str(self.get(f"quick_input.{slot}", "") or "").strip():
-                out[f"quick_pwd_{index}"] = self.hotkey(f"quick_pwd_{index}")
+            token = self.hotkey(f"quick_pwd_{index}")
+            if str(self.get(f"quick_input.{slot}", "") or "").strip() and token:
+                out[f"quick_pwd_{index}"] = token
         return out
 
     # ------------------------------------------------------------------
@@ -433,13 +529,12 @@ class Config:
         if is_frozen() and self.data.get("scripts_dir") == "data/scripts":
             self.data["scripts_dir"] = "scripts"
 
-        hk = self.data.setdefault("hotkeys", {})
-        for action, default in DEFAULT_HOTKEYS.items():
-            value = hk.get(action)
-            if not isinstance(value, str) or not value.strip():
-                hk[action] = default
-            else:
-                hk[action] = value.strip().lower()
+        # 热键：只做「去空 / 转小写」的清理，**绝不补默认值**。
+        # 出厂就是一个键都不绑（见 module docstring），补默认等于把用户没同意
+        # 的按键抢过来——F1 帮助键会变成「敲剪贴板」，这事被投诉过。
+        self.data["hotkeys"] = sanitize_bindings(self.data.get("hotkeys"))
+        profile = self.data.get("hotkey_profile")
+        self.data["hotkey_profile"] = profile if isinstance(profile, str) else ""
 
         win = self.data.setdefault("window", {})
         # 尺寸迁移：正好等于历史默认尺寸 => 用户没调过，升级到新版默认 1000x700

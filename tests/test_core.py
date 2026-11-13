@@ -29,6 +29,9 @@ from core.hotkey_hook import (HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
                               KeyboardHook, hook_supported, should_passthrough)
 from core.win_input import INJECT_TAG
 from core.hotkey_manager import HotkeyManager, display_name, normalize_token, parse_key
+from core.hotkey_sets import (STANDARD_HOTKEYS, STANDARD_KEY, delete_set,
+                              find_set, list_sets, sanitize_bindings,
+                              save_set, sets_dir, suggest_name)
 from core.player import MODE_STEP, MODE_TIMED, MacroPlayer
 from core.recorder import Recorder, key_to_token, token_to_key
 from core.poll_recorder import PollRecorder, _is_blacklisted_process
@@ -1678,15 +1681,41 @@ class TestRecordStartHotkey:
                 ("record_start", "record_stop", "record_pause")]
         assert len(set(trio)) == 3
 
-    def test_old_config_without_record_start_gets_default(self, tmp_path: Path):
-        """升级前的配置文件里没有 record_start，加载后必须自动补上 F12。"""
+    def test_old_config_without_record_start_stays_unbound(self, tmp_path: Path):
+        """老配置里没有的键**不会被补默认值**（2026-11-13 起出厂一个键都不绑）。
+
+        以前这里断言「缺的键补成 F12」。改成热键套之后这条规则反过来了：
+        配置里没有就是没绑，凭空补一个等于替用户占键。
+        """
         path = tmp_path / "config.json"
         path.write_text(json.dumps(
             {"hotkeys": {"record_stop": "f10", "play_toggle": "f6"}},
             ensure_ascii=False), encoding="utf-8")
         cfg = Config(path)
-        assert cfg.hotkey("record_start") == "f12"
+        assert cfg.hotkey("record_start") == ""        # 没配过 = 没绑
         assert cfg.hotkey("record_stop") == "f10"      # 用户改过的键原样保留
+        assert cfg.hotkey_profile == ""                # 还没有套
+
+    def test_migrate_old_bindings_into_profile(self, tmp_path: Path):
+        """老配置（有绑定、没套）启动时被存成「我的热键」套。"""
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(
+            {"hotkeys": {"record_stop": "f10", "play_toggle": "f6"}}),
+            encoding="utf-8")
+        cfg = Config(path)
+        assert cfg.migrate_hotkey_profile() is True
+        item = cfg.current_hotkey_set()
+        assert item is not None and item.name == "我的热键"
+        assert item.hotkeys == {"record_stop": "f10", "play_toggle": "f6"}
+        # 幂等：再跑一次什么都不做
+        assert cfg.migrate_hotkey_profile() is False
+
+    def test_migrate_noop_for_factory_default(self, tmp_path: Path):
+        """出厂配置（一个键都没绑）不该凭空造出套文件。"""
+        cfg = Config(tmp_path / "config.json")
+        assert cfg.migrate_hotkey_profile() is False
+        assert cfg.hotkey_profile == ""
+        assert not (tmp_path / "hotkey_sets").exists()
 
     def test_poll_recorder_accepts_start_vk(self):
         """兼容通道要能接收开始键的 VK，录制中把它跳过而不是录成一步。"""
@@ -2850,8 +2879,10 @@ class TestConfig:
         from core.config import DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH
 
         cfg = Config(tmp_path / "config.json")
-        assert cfg.hotkey("record_stop") == "f9"
-        assert cfg.hotkey("step_next") == "page_down"
+        # ★ 出厂一个热键都不绑：装完就抢 F 区会被当成「键盘坏了」
+        assert cfg.hotkeys == {}
+        assert cfg.hotkey("record_stop") == ""
+        assert cfg.hotkey_profile == ""
         # 第五阶段：默认窗口尺寸提升到 1000x700
         assert DEFAULT_WINDOW_WIDTH == 1000 and DEFAULT_WINDOW_HEIGHT == 700
         assert cfg.get("window.width") == DEFAULT_WINDOW_WIDTH
@@ -2919,13 +2950,16 @@ class TestConfig:
         path = tmp_path / "config.json"
         path.write_text("{ broken", encoding="utf-8")
         cfg = Config(path)
-        assert cfg.hotkey("record_stop") == "f9"
+        assert cfg.hotkey("record_stop") == ""      # 回落到出厂：不绑键
         assert path.with_suffix(".json.bak").exists()
 
-    def test_blank_hotkey_restored_to_default(self, tmp_path: Path):
+    def test_blank_hotkey_stays_unbound(self, tmp_path: Path):
+        """空白值 = 没绑，不该被填回 F9（那等于替用户占键）。"""
         path = tmp_path / "config.json"
         path.write_text('{"hotkeys": {"record_stop": "  "}}', encoding="utf-8")
-        assert Config(path).hotkey("record_stop") == "f9"
+        cfg = Config(path)
+        assert cfg.hotkey("record_stop") == ""
+        assert "record_stop" not in cfg.hotkeys    # 空值不进「已绑定」表
 
     def test_legacy_flat_keys_migrated(self, tmp_path: Path):
         path = tmp_path / "config.json"
@@ -2946,6 +2980,131 @@ class TestConfig:
         path = cfg.scripts_path()
         assert path.exists()
         assert path.name == "scripts"
+
+
+# ---------------------------------------------------------------------------
+# 热键套（core/hotkey_sets.py + Config 上的封装）
+# ---------------------------------------------------------------------------
+class TestHotkeySets:
+    """一套命名好的绑定：内置一套、用户套落盘、切换与自动另存。"""
+
+    def test_builtin_standard_present(self, tmp_path: Path):
+        items = list_sets(tmp_path / "config.json")
+        assert len(items) == 1
+        item = items[0]
+        assert item.builtin and item.key == STANDARD_KEY
+        assert item.hotkeys == STANDARD_HOTKEYS
+        # 标准套必须覆盖全部 13 个动作，否则换上去会丢功能
+        assert len(item.hotkeys) == 13
+
+    def test_save_set_writes_file(self, tmp_path: Path):
+        cfg_path = tmp_path / "config.json"
+        item = save_set(cfg_path, "游戏专用", {"record_stop": "f9"})
+        assert item is not None and item.key == "user:游戏专用"
+        path = sets_dir(cfg_path) / "游戏专用.json"
+        assert path.exists()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert raw["name"] == "游戏专用"
+        assert raw["hotkeys"] == {"record_stop": "f9"}
+        # 再读回来能看见它，且排在内置套后面
+        names = [i.name for i in list_sets(cfg_path)]
+        assert names[0].startswith("标准套")
+        assert "游戏专用" in names
+
+    def test_save_same_name_overwrites(self, tmp_path: Path):
+        cfg_path = tmp_path / "config.json"
+        save_set(cfg_path, "我的", {"record_stop": "f9"})
+        save_set(cfg_path, "我的", {"record_stop": "f10"})
+        assert len([i for i in list_sets(cfg_path) if not i.builtin]) == 1
+        assert find_set(cfg_path, "user:我的").hotkeys == {"record_stop": "f10"}
+
+    def test_delete_only_user_sets(self, tmp_path: Path):
+        cfg_path = tmp_path / "config.json"
+        save_set(cfg_path, "临时", {"record_stop": "f9"})
+        assert delete_set(cfg_path, STANDARD_KEY) is False   # 内置不可删
+        assert find_set(cfg_path, STANDARD_KEY) is not None
+        assert delete_set(cfg_path, "user:临时") is True
+        assert find_set(cfg_path, "user:临时") is None
+
+    def test_suggest_name_avoids_collision(self, tmp_path: Path):
+        cfg_path = tmp_path / "config.json"
+        assert suggest_name(cfg_path) == "我的热键"
+        save_set(cfg_path, "我的热键", {})
+        assert suggest_name(cfg_path) == "我的热键 2"
+        save_set(cfg_path, "我的热键 2", {})
+        assert suggest_name(cfg_path) == "我的热键 3"
+
+    def test_broken_file_is_skipped(self, tmp_path: Path):
+        """手改坏一个套文件，不该让整个下拉框消失。"""
+        cfg_path = tmp_path / "config.json"
+        save_set(cfg_path, "好套", {"record_stop": "f9"})
+        (sets_dir(cfg_path) / "坏套.json").write_text("{ 乱写", encoding="utf-8")
+        names = [i.name for i in list_sets(cfg_path)]
+        assert "好套" in names
+        assert all("坏套" not in n for n in names)
+
+    def test_sanitize_drops_blanks_and_lowercases(self):
+        cleaned = sanitize_bindings({
+            "record_stop": " F9 ", "play_toggle": "", "step_next": None,
+            "  ": "f1", 42: "f2",
+        })
+        assert cleaned == {"record_stop": "f9"}
+
+
+class TestHotkeyProfile:
+    """「热键套」在配置对象上的行为。"""
+
+    def test_apply_and_clear(self, tmp_path: Path):
+        cfg = Config(tmp_path / "config.json")
+        item = find_set(cfg.path, STANDARD_KEY)
+        cfg.apply_hotkey_set(item)
+        assert cfg.hotkey_profile == STANDARD_KEY
+        assert cfg.hotkey("record_stop") == "f9"
+        assert len(cfg.hotkeys) == 13
+
+        cfg.clear_hotkeys()
+        assert cfg.hotkey_profile == ""
+        assert cfg.hotkeys == {}
+        assert cfg.hotkey("record_stop") == ""
+
+    def test_saving_without_edit_creates_nothing(self, tmp_path: Path):
+        """只是点「保存设置」、没改任何键 → 不能凭空复制出一个套。"""
+        cfg = Config(tmp_path / "config.json")
+        cfg.apply_hotkey_set(find_set(cfg.path, STANDARD_KEY))
+        assert cfg.ensure_custom_profile() is None
+        assert cfg.hotkey_profile == STANDARD_KEY
+        assert not (tmp_path / "hotkey_sets").exists()
+
+    def test_edit_from_builtin_creates_new_set(self, tmp_path: Path):
+        """第一次改键：内置套不动，另存一个用户套。"""
+        cfg = Config(tmp_path / "config.json")
+        cfg.apply_hotkey_set(find_set(cfg.path, STANDARD_KEY))
+        cfg.set_hotkey("record_stop", "f10")          # 用户改了停止录制
+        item = cfg.ensure_custom_profile()
+
+        assert item is not None and item.name == "我的热键"
+        assert cfg.hotkey_profile == "user:我的热键"
+        assert item.hotkeys["record_stop"] == "f10"
+        # 内置套保持原样
+        assert find_set(cfg.path, STANDARD_KEY).hotkeys["record_stop"] == "f9"
+        # 再改一次：写回同一个套，不再新建
+        cfg.set_hotkey("record_pause", "f12")
+        assert cfg.ensure_custom_profile() is None
+        assert len([i for i in cfg.hotkey_sets() if not i.builtin]) == 1
+        assert find_set(cfg.path, "user:我的热键").hotkeys["record_pause"] == "f12"
+
+    def test_profile_survives_reload(self, tmp_path: Path):
+        path = tmp_path / "config.json"
+        cfg = Config(path)
+        cfg.apply_hotkey_set(find_set(path, STANDARD_KEY))
+        cfg.set_hotkey("play_toggle", "f5")
+        cfg.ensure_custom_profile()
+        cfg.save()
+
+        again = Config(path)
+        assert again.hotkey_profile == "user:我的热键"
+        assert again.hotkey("play_toggle") == "f5"
+        assert again.hotkey("record_stop") == "f9"
 
 
 # ---------------------------------------------------------------------------
@@ -4160,11 +4319,13 @@ class TestQuickInputConfig:
         assert cfg.quick_paste_enabled is True
         assert cfg.quick_delay_ms == 8
 
-    def test_hotkey_defaults(self, cfg):
-        assert cfg.hotkey("quick_paste") == "f1"
-        assert [cfg.hotkey(f"quick_pwd_{i}") for i in (1, 2, 3)] == ["f2", "f3", "f4"]
+    def test_hotkeys_unbound_by_default(self, cfg):
+        """快捷输入的四条热键出厂也不绑（由热键套决定）。"""
+        assert cfg.hotkey("quick_paste") == ""
+        assert [cfg.hotkey(f"quick_pwd_{i}") for i in (1, 2, 3)] == ["", "", ""]
+        # 「标准套」里仍然有这四个键，选它就能用
         for action in QUICK_HOTKEY_ACTIONS:
-            assert action in DEFAULT_HOTKEYS
+            assert action in STANDARD_HOTKEYS
 
     def test_method_defaults_to_auto(self, cfg):
         """默认必须是 auto：钉死某条通道等于关掉整条降级阶梯。
@@ -4206,7 +4367,12 @@ class TestQuickInputConfig:
         assert cfg.quick_hotkey_bindings() == {}
 
     def test_bindings_only_for_filled_slots(self, cfg):
+        """只有「填了密码 + 设了键」的槽才注册。"""
         cfg.set("quick_input.enabled", True)
+        # 出厂不绑键 → 一条都不注册（不是「默默按 F1」）
+        assert cfg.quick_hotkey_bindings() == {}
+        cfg.set_hotkey("quick_paste", "f1")
+        cfg.set_hotkey("quick_pwd_2", "f3")
         assert cfg.quick_hotkey_bindings() == {"quick_paste": "f1"}
         cfg.set_quick_password("pwd_2", "xyz")
         assert cfg.quick_hotkey_bindings() == {

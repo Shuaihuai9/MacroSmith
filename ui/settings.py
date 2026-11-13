@@ -6,17 +6,21 @@
 
 ★ 快捷输入**不在这里**：它已独立成一级页面（``ui/quick_page.py``）。
 两页共用的只有 :class:`HotkeyEdit`（从本模块导入），别再把它搬回去。
+
+★ 出厂不绑任何热键（2026-11-13）：设置页最上面是「热键套」下拉，选中哪一套
+就用哪一套的键；一个都没选时下面 9 个框是空的，表示「这个功能没有热键」。
+详见 :mod:`core.hotkey_sets`。
 """
 
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import (QCheckBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QScrollArea,
+                               QLineEdit, QPushButton, QScrollArea, QToolButton,
                                QVBoxLayout, QWidget)
 
-from core.config import DEFAULT_HOTKEYS, HOTKEY_LABELS
+from core.config import HOTKEY_LABELS
 from core.hotkey_manager import display_name, normalize_token, probe_hotkey
 from ui import styles
 from ui.spin_box import NumberField
@@ -36,9 +40,21 @@ def _unit_row(field: QWidget, unit: str) -> QWidget:
     return row
 
 # Qt 按键枚举名 -> 我们的键名 token 的后备映射（pynput 名与 Qt 名不完全一致）
+#
+# ★ 这里必须用 **Qt 的真实枚举名**（去掉 ``Key_`` 前缀再小写），别用 pynput 的
+#   写法想当然。2026-11-13 实测：``Qt.Key_PageDown`` 的 name 是 ``Key_PageDown``
+#   -> ``pagedown``，而这里原来只写了 pynput 风格的 ``pgdown``，于是用户在热键框
+#   里按 PageDown / PageUp / Insert / Delete / 小键盘 Enter **毫无反应**
+#   （映射查不到 -> 退回 ``event.text()`` -> 这些键没有文本 -> 返回空串）。
+#   标准套里 ``step_next`` 恰好就是 PageDown，用户想改它都改不了。
+#   两种写法都留着：pynput 风格供内部 token 复用，Qt 风格供这里查表。
 _QT_KEY_FALLBACK: dict[str, str] = {
-    "pgup": "page_up", "pgdown": "page_down", "escape": "escape",
-    "return": "enter", "del": "delete", "ins": "insert",
+    "pgup": "page_up", "pgdown": "page_down",
+    "pageup": "page_up", "pagedown": "page_down",
+    "escape": "escape",
+    "return": "enter", "enter": "enter",
+    "del": "delete", "delete": "delete",
+    "ins": "insert", "insert": "insert",
     "backspace": "backspace", "space": "space", "tab": "tab",
     "capslock": "caps_lock", "up": "up", "down": "down",
     "left": "left", "right": "right", "home": "home", "end": "end",
@@ -46,9 +62,22 @@ _QT_KEY_FALLBACK: dict[str, str] = {
 
 
 class HotkeyEdit(QLineEdit):
-    """热键捕获输入框：聚焦后按任意键即录入该键。"""
+    """热键捕获输入框：聚焦后按任意键录入该键，右侧 × 清空。
+
+    三件事一起做，因为它们都发生在同一个控件里：
+
+    * **录入**：点进来按一个键就设成那个键（Esc 只是退出录入状态，不改值）；
+    * **清空**：右侧常驻一个小小的 ×（**一直显示**，空值时置灰不可点）。
+      用户的原始诉求是「想清空这个键，按 ESC 只是退出选择状态，旁边也没清空
+      按钮」——**清空必须有一条看得见的路**，不能指望用户猜「再按一次别的键覆盖」。
+      清空的语义是「这个功能没有热键」，仍可点按钮操作，所以不会真的让功能失效；
+    * **冲突标记**：同一个键被两个功能占用时整框标红 + tooltip 说明和谁撞了。
+      标记由上层统一算（要跨两个页面），这里只负责显示。
+    """
 
     key_captured = Signal(str)
+    #: 用户点了 × 清空（此时 ``key_captured`` 也会发一次空串）
+    cleared = Signal()
 
     def __init__(self, token: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -56,19 +85,74 @@ class HotkeyEdit(QLineEdit):
         self.setAlignment(Qt.AlignCenter)
         self.setPlaceholderText("点击后按键")
         self.setFixedWidth(130)
-        self.setToolTip("点击此框后按下想使用的按键（例如 F6、PageDown）")
+
+        self._token = ""
+        self._conflict = ""
+        self._base_tip = (
+            "点击此框后按下想使用的按键（例如 F6、PageDown）。\n"
+            "改错了点右侧 × 清空：这个功能将没有热键，仍可点按钮操作。")
+        super().setToolTip(self._base_tip)
+
+        self._clear_btn = QToolButton(self)
+        self._clear_btn.setObjectName("HotkeyClear")
+        self._clear_btn.setText("×")
+        self._clear_btn.setToolTip("清空这个热键（该功能将没有热键，仍可点按钮操作）")
+        self._clear_btn.setCursor(Qt.PointingHandCursor)
+        self._clear_btn.setFixedSize(18, 18)
+        self._clear_btn.setFocusPolicy(Qt.NoFocus)
+        self._clear_btn.clicked.connect(self.clear_token)
+
         self.set_token(token)
 
+    # ------------------------------------------------------------------
     def set_token(self, token: str) -> None:
         self._token = normalize_token(token)
         self.setText(display_name(self._token))
+        # ★ × 常显（用户 2026-11-13 要求，别再改成按需隐藏）：
+        #   空框里也留一个位置，「这里能清空」才一眼可见；空值时置灰不可点。
+        self._clear_btn.setEnabled(bool(self._token))
 
     def token(self) -> str:
         return self._token
 
+    def clear_token(self) -> None:
+        """清空这个热键（只改界面，落盘由上层在「保存」时决定）。"""
+        if not self._token:
+            return
+        self.set_token("")
+        self.key_captured.emit("")
+        self.cleared.emit()
+
+    def set_conflict(self, text: str = "") -> None:
+        """标出「这个键和别的功能撞了」；传空串表示无冲突。"""
+        self._conflict = text or ""
+        conflict = bool(self._conflict)
+        if self.property("hotkeyConflict") != conflict:
+            self.setProperty("hotkeyConflict", conflict)
+            # 动态属性变了必须 unpolish/polish，否则 QSS 不会重新求值
+            self.style().unpolish(self)
+            self.style().polish(self)
+        tip = self._base_tip
+        if conflict:
+            tip = f"{tip}\n\n⚠ {self._conflict}"
+        super().setToolTip(tip)
+
+    @property
+    def conflict(self) -> str:
+        return self._conflict
+
     # ------------------------------------------------------------------
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._clear_btn.move(self.width() - 22,
+                             (self.height() - self._clear_btn.height()) // 2)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        """捕获按键：转成统一的键名 token，Esc 取消录入。"""
+        """捕获按键：转成统一的键名 token，Esc 取消录入。
+
+        ★ Esc **不是清空**：它是「我不改了，退出」的通用语义，改成清空会让
+        误按一下就把热键弄丢。清空有专门的 × 按钮。
+        """
         key = event.key()
         if key in (Qt.Key_Escape, Qt.Key_unknown):
             self.clearFocus()
@@ -87,8 +171,12 @@ class HotkeyEdit(QLineEdit):
             self.setText(f"不支持：{token}")
             event.accept()
             return
-        self._token = normalize_token(token)
-        self.setText(display_name(self._token))
+        # ★ 必须走 set_token()，不能在这儿直接写 ``self._token``。
+        #   2026-11-13 栽过：这里手写赋值漏掉了 × 的启用状态，于是
+        #   「空框里抓一个键」之后 × 仍是灰的、点不动，非要点一次保存
+        #   （走 load_hotkeys -> set_token）才恢复——用户看到的就是
+        #   「想清空必须先保存一下」。
+        self.set_token(token)
         self.key_captured.emit(self._token)
         event.accept()
 
@@ -128,6 +216,11 @@ class SettingsPage(QWidget):
     """设置页。"""
 
     hotkeys_saved = Signal(dict)      # {动作名: token}
+    hotkeys_reload = Signal()         # 「撤销热键改动」：从配置重读，不写盘
+    hotkey_edited = Signal(str)       # 用户改了某个热键框（动作名）
+    hotkey_profile_changed = Signal(str)   # 换热键套（套的 key，空串 = 不启用）
+    hotkey_profile_save_as = Signal()      # 「另存为新套…」
+    hotkey_profile_delete = Signal()       # 「删除此套」
     options_saved = Signal(dict)      # {player.*: 值}
     exclusive_toggled = Signal(bool)  # 热键独占模式开关
     merge_changed = Signal(bool, bool)  # (自动合并组合键, 自动合并双击/三击)
@@ -144,7 +237,7 @@ class SettingsPage(QWidget):
         title.setObjectName("CardTitle")
         outer.addWidget(title)
 
-        hint = QLabel("修改完全局热键后需点击“保存设置”生效；脚本会保存到下方脚本目录。")
+        hint = QLabel("热键选中一套即可使用；脚本会保存到下方脚本目录。")
         hint.setObjectName("Hint")
         outer.addWidget(hint)
 
@@ -160,6 +253,9 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(12)
 
+        # ------------------------- 热键套 -------------------------
+        layout.addWidget(self._build_profile_group())
+
         # ------------------------- 热键 -------------------------
         group_hotkey = QGroupBox("全局热键")
         form = QFormLayout(group_hotkey)
@@ -173,8 +269,11 @@ class SettingsPage(QWidget):
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(8)
-            edit = HotkeyEdit(DEFAULT_HOTKEYS[action], row)
+            # 出厂是空串：没选热键套时这些框就是空的（= 该功能没有热键）
+            edit = HotkeyEdit("", row)
             edit.setToolTip(describe)
+            # 改键要通知主窗口：它负责「第一次改键时自动另存为新套」
+            edit.key_captured.connect(lambda _token, a=action: self.hotkey_edited.emit(a))
             self._edits[action] = edit
             row_layout.addWidget(edit)
             tip = QLabel(describe)
@@ -310,8 +409,9 @@ class SettingsPage(QWidget):
         # ------------------------- 按钮 -------------------------
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        self.btn_reset = QPushButton("恢复默认热键")
+        self.btn_reset = QPushButton("撤销热键改动")
         self.btn_reset.setObjectName("GhostButton")
+        self.btn_reset.setToolTip("把热键框恢复成当前配置里的样子（不写盘）")
         self.btn_reset.clicked.connect(self.reset_hotkeys)
         buttons.addWidget(self.btn_reset)
         self.btn_save = QPushButton("保存设置")
@@ -319,6 +419,81 @@ class SettingsPage(QWidget):
         self.btn_save.clicked.connect(self._on_save)
         buttons.addWidget(self.btn_save)
         outer.addLayout(buttons)
+
+    def _build_profile_group(self) -> QGroupBox:
+        """「热键套」：整套绑定一起切换。
+
+        为什么要有这一层（用户 2026-11-13 的反馈）：13 个功能原来全都硬绑着
+        出厂键，一装就占了半个键盘；而且「功能 = 某个键」被写死在提示里，
+        用户改了键，提示还是旧键。现在把「一套键」当对象管理，提示语也跟着
+        当前绑定实时生成（见 ``MainWindow._refresh_sidebar_hints``）。
+        """
+        group = QGroupBox("热键套")
+        box = QVBoxLayout(group)
+        box.setContentsMargins(10, 8, 10, 8)
+        box.setSpacing(8)
+
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lay.addWidget(QLabel("当前套"))
+
+        self.combo_profile = QComboBox()
+        self.combo_profile.setFixedWidth(300)
+        self.combo_profile.setToolTip(
+            "选中一套，下面的热键立刻换成那套的按键（并写入配置）。\n"
+            "「未设置」= 一个键都不占用，全部功能只能点按钮。")
+        self.combo_profile.currentIndexChanged.connect(self._on_profile_changed)
+        lay.addWidget(self.combo_profile)
+
+        self.btn_profile_save = QPushButton("另存为新套…")
+        self.btn_profile_save.setObjectName("GhostButton")
+        self.btn_profile_save.setToolTip(
+            "把当前这些按键存成一个新套（可自己起名），\n"
+            "文件写在配置目录旁边的 hotkey_sets 文件夹里。")
+        self.btn_profile_save.clicked.connect(self.hotkey_profile_save_as.emit)
+        lay.addWidget(self.btn_profile_save)
+
+        self.btn_profile_delete = QPushButton("删除此套")
+        self.btn_profile_delete.setObjectName("GhostButton")
+        self.btn_profile_delete.setToolTip("删除当前的用户套（内置的「标准套」不能删）")
+        self.btn_profile_delete.setEnabled(False)
+        self.btn_profile_delete.clicked.connect(self.hotkey_profile_delete.emit)
+        lay.addWidget(self.btn_profile_delete)
+        lay.addStretch(1)
+        box.addWidget(row)
+
+        hint = QLabel(
+            "· 出厂**不占用任何按键**：选一套现成的，或者直接去改下面某一个键。\n"
+            "· 第一次改键时，当前这套会**自动另存为一个新套**（名字叫「我的热键」），"
+            "之后的改动都写进那个套里，内置套不会被改坏。\n"
+            "· 留空的框表示「这个功能没有热键」，可以照常点按钮操作。")
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        return group
+
+    def _on_profile_changed(self, index: int) -> None:
+        """下拉换套：把 key 抛给主窗口（主窗口才知道怎么落盘与重挂）。"""
+        if index < 0:
+            return
+        key = str(self.combo_profile.itemData(index) or "")
+        self.btn_profile_delete.setEnabled(key.startswith("user:"))
+        self.hotkey_profile_changed.emit(key)
+
+    def load_profiles(self, profiles, current_key: str) -> None:
+        """填充「热键套」下拉（不触发切换信号）。"""
+        self.combo_profile.blockSignals(True)
+        self.combo_profile.clear()
+        self.combo_profile.addItem("未设置（不占用任何按键）", "")
+        for item in profiles:
+            suffix = "" if item.builtin else "  ·自定义"
+            self.combo_profile.addItem(f"{item.name}{suffix}", item.key)
+        index = self.combo_profile.findData(current_key)
+        self.combo_profile.setCurrentIndex(max(0, index))
+        self.combo_profile.blockSignals(False)
+        self.btn_profile_delete.setEnabled(str(current_key).startswith("user:"))
 
     def minimumSizeHint(self):  # noqa: N802 - Qt 命名
         """压低最小高度，避免设置页把窗口最小尺寸顶高。"""
@@ -367,13 +542,32 @@ class SettingsPage(QWidget):
             if edit is not None:
                 edit.set_token(token)
 
-    def reset_hotkeys(self) -> None:
-        """把热键输入框恢复成默认值（需再点保存才生效）。"""
+    def apply_hotkeys(self, hotkeys: dict[str, str]) -> None:
+        """整体替换（换热键套用）：没出现在 map 里的框一律清空。"""
         for action, edit in self._edits.items():
-            edit.set_token(DEFAULT_HOTKEYS[action])
+            edit.set_token(hotkeys.get(action, ""))
+
+    def reset_hotkeys(self) -> None:
+        """「撤销热键改动」：请主窗口按配置重填，不写盘。
+
+        以前这里是「恢复默认热键」（填 :data:`DEFAULT_HOTKEYS`）。有了热键套
+        之后「默认」不再是一个固定集合——可能是用户自己的套，所以改成
+        「回到已保存的样子」，这才是用户按这个按钮时真正想要的结果。
+        """
+        self.hotkeys_reload.emit()
 
     def hotkey_values(self) -> dict[str, str]:
         return {action: edit.token() for action, edit in self._edits.items()}
+
+    def active_hotkeys(self) -> dict[str, str]:
+        """本页当前（可能还没保存）真正绑了键的动作。"""
+        return {action: edit.token() for action, edit in self._edits.items()
+                if edit.token()}
+
+    def mark_conflicts(self, conflicts: dict[str, str]) -> None:
+        """把「动作名 -> 冲突说明」画到对应输入框上（不在表里=无冲突）。"""
+        for action, edit in self._edits.items():
+            edit.set_conflict(conflicts.get(action, ""))
 
     def duplicate_hotkeys(self) -> dict[str, list[str]]:
         """返回重复绑定的键 -> 动作列表，用于保存前提示。"""

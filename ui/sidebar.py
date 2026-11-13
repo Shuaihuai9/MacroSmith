@@ -162,12 +162,13 @@ class Sidebar(QWidget):
         # 录制页后移，避免用户默认停在录制页误覆写已保存脚本。
         self.btn_library = IconButton(
             icons.ICON_LIBRARY,
-            "回放与脚本（选择脚本 · 循环设置 · 开始/停止回放）", self)
+            "回放与脚本\n选择脚本 · 循环设置 · 开始/停止回放", self)
         self.btn_record = IconButton(
-            icons.ICON_RECORD, "录制与步骤编辑（F11 暂停/继续 · F9 停止录制）", self)
+            icons.ICON_RECORD, "录制与步骤编辑\n录制 · 步骤列表 · 插入/编辑/批量操作", self)
+        # 提示里的按键由 MainWindow._refresh_sidebar_hints 按当前绑定重写，
+        # 这里只给「还没绑定任何键」时的默认文案（**别再写死 F1–F4**）。
         self.btn_quick = IconButton(
-            icons.ICON_KEYBOARD,
-            "快捷输入（F1 敲剪贴板 · F2–F4 敲快捷密码）", self)
+            icons.ICON_KEYBOARD, "快捷输入\n把一段文本逐字符敲进当前输入框", self)
         self.btn_settings = IconButton(icons.ICON_SETTINGS, "设置（热键与录制选项）", self)
         self.btn_about = IconButton(icons.ICON_ABOUT, "关于 宏匠", self)
 
