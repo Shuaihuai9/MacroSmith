@@ -80,9 +80,18 @@ Name: "{autodesktop}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"; \
     Tasks: desktopicon
 
 [Run]
-; 安装完成后立即运行（用户可取消勾选）
+; 安装完成后立即运行（用户可取消勾选）。
+;
+; ★ 必须带 shellexec，否则装完点「完成」会弹「CreateProcess 失败；错误代码 740 /
+;   请求的操作需要提升」（2026-11-13 用户实测）。
+;   原因：宏匠的 exe 清单是 requestedExecutionLevel=requireAdministrator
+;   （Nuitka --windows-uac-admin，为了能抓腾讯系游戏大厅的操作），而 Inno 的
+;   [Run] 默认走 CreateProcess——Windows 不允许普通权限的父进程直接创建要求提权
+;   的子进程，于是返回 ERROR_ELEVATION_REQUIRED(740)。
+;   shellexec 改用 ShellExecuteEx，由系统自己去弹 UAC，和用户双击桌面快捷方式
+;   走的是同一条路（那条路一直是好的，可以互相印证）。
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppNameCN}}"; \
-    Flags: nowait postinstall skipifsilent
+    Flags: nowait postinstall skipifsilent shellexec
 
 [Uninstall]
 ; 注意：这里故意不写 UninstallDelete。
