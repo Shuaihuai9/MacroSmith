@@ -315,7 +315,7 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
 }}
 
 /* 热键框：冲突时整框标红（2026-11-13）。用动态属性而不是内联样式，
-   这样清空/换热键套时只要 unpolish/polish 一下就能复位。 */
+   这样清空/换方案时只要 unpolish/polish 一下就能复位。 */
 QLineEdit[hotkeyConflict="true"] {{
     border: 1px solid {DANGER};
     background: {DANGER_LIGHT};

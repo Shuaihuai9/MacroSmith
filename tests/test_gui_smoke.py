@@ -4677,10 +4677,10 @@ class TestQuickInputRecorderPollution:
 
 
 # ===========================================================================
-# 2026-11-13：热键套（出厂不绑键 / 选套 / 改键自动另存 / 提示语跟随）
+# 2026-11-13：快捷键方案（出厂不绑键 / 选方案 / 改键自动另存 / 提示语跟随）
 # ===========================================================================
 class TestHotkeyProfileGUI:
-    """「热键套」在界面上的行为。
+    """「快捷键方案」在界面上的行为。
 
     这一组**不能**用 ``window`` 夹具：那个夹具会先把 13 个默认热键全写进配置，
     而本功能要验的正是「出厂一个键都不绑」的初始状态。
@@ -4715,7 +4715,7 @@ class TestHotkeyProfileGUI:
         assert "未设置" in fresh.sidebar.btn_record.toolTip()
 
     def test_select_standard_profile_registers_keys(self, fresh, qapp):
-        """选中「标准套」→ 13 个键立刻生效，提示语跟着换成真实按键。"""
+        """选中「标准方案」→ 13 个键立刻生效，提示语跟着换成真实按键。"""
         combo = fresh.page_settings.combo_profile
         combo.setCurrentIndex(combo.findData(STANDARD_KEY))
         _pump(qapp, 80)
@@ -4747,7 +4747,7 @@ class TestHotkeyProfileGUI:
         assert "未设置" in fresh.sidebar.btn_record.toolTip()
 
     def test_edit_key_creates_user_set_file(self, fresh, qapp, tmp_path):
-        """改一个键并保存 → 自动新建用户套文件，内置套不被改坏。"""
+        """改一个键并保存 → 自动新建用户方案文件，内置方案不被改坏。"""
         combo = fresh.page_settings.combo_profile
         combo.setCurrentIndex(combo.findData(STANDARD_KEY))
         _pump(qapp, 60)
@@ -4763,7 +4763,7 @@ class TestHotkeyProfileGUI:
         assert path.exists(), "第一次改键必须落一个套文件"
         saved = find_set(fresh.config.path, "user:我的热键")
         assert saved is not None and saved.hotkeys["record_stop"] == "f10"
-        # 内置套原样：标准套仍然是 F9
+        # 内置方案原样：标准方案仍然是 F9
         assert find_set(fresh.config.path, STANDARD_KEY).hotkeys["record_stop"] == "f9"
 
     def test_quick_paste_hotkey_is_editable(self, fresh, qapp):
@@ -4778,8 +4778,8 @@ class TestHotkeyProfileGUI:
         assert "F7" in page.chk_enabled.text()
 
     def test_delete_user_set_clears_bindings(self, fresh, qapp, tmp_path):
-        """「删除此套」：删掉套文件 + 清空当前绑定 + 下拉回到「未设置」。"""
-        # 先造一个用户套出来（改一个键就自动另存）
+        """「删除此方案」：删掉方案文件 + 清空当前绑定 + 下拉回到「不使用方案」。"""
+        # 先造一个用户方案出来（改一个键就自动另存）
         edit = fresh.page_settings._edits["record_stop"]
         edit.set_token("f10")
         fresh.page_settings.btn_save.click()
@@ -4798,15 +4798,15 @@ class TestHotkeyProfileGUI:
         assert fresh.config.hotkey("record_stop") == ""
         assert fresh.hotkeys.binding_display("record_stop") == ""   # 真的释放了
         assert find_set(fresh.config.path, key) is None
-        assert "已删除热键套" in fresh.message_label.text()
+        assert "已删除方案" in fresh.message_label.text()
 
     def test_delete_builtin_set_is_refused(self, fresh, qapp):
-        """内置「标准套」删不掉：按钮直接禁用，底层也有一道拒绝。"""
+        """内置「标准方案」删不掉：按钮直接禁用，底层也有一道拒绝。"""
         combo = fresh.page_settings.combo_profile
         combo.setCurrentIndex(combo.findData(STANDARD_KEY))
         _pump(qapp, 60)
         assert fresh.config.hotkey("record_stop") == "f9"
-        # 第一层：当前是内置套，按钮本身就不给点
+        # 第一层：当前是内置方案，按钮本身就不给点
         assert fresh.page_settings.btn_profile_delete.isEnabled() is False
 
         # 第二层：就算绕过来直接调，也只提示不执行
@@ -4818,7 +4818,7 @@ class TestHotkeyProfileGUI:
         assert find_set(fresh.config.path, STANDARD_KEY) is not None
 
     def test_delete_button_enabled_only_for_user_set(self, fresh, qapp):
-        """选中「未设置」时也不能删（没有套可删），选了用户套才可以。"""
+        """选中「不使用方案」时也不能删（没有方案可删），选了用户方案才可以。"""
         combo = fresh.page_settings.combo_profile
         assert fresh.page_settings.btn_profile_delete.isEnabled() is False
 
@@ -4933,7 +4933,7 @@ class TestHotkeyClearAndConflict:
         ``pgup/pgdown/ins/del/return``，而 Qt 的真实枚举名是
         ``Key_PageUp/Key_PageDown/Key_Insert/Key_Delete/Key_Enter``，查不到映射就
         退回去取 ``event.text()``，这些键没有文本 -> 返回空串 -> 框里毫无反应。
-        标准套里的 ``step_next`` 正是 PageDown，用户连改它都改不了。
+        标准方案里的 ``step_next`` 正是 PageDown，用户连改它都改不了。
         """
         edit = self._edit(fresh, "record_stop")
         cases = [
@@ -5010,7 +5010,7 @@ class TestHotkeyClearAndConflict:
 
 
 class TestHotkeySetNameDialog:
-    """另存为热键套：名字清洗与覆盖判断复用脚本命名弹窗。"""
+    """另存为方案：名字清洗与覆盖判断复用脚本命名弹窗。"""
 
     def test_slugify_keeps_chinese_and_strips_illegal(self):
         from core.hotkey_sets import slugify

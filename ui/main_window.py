@@ -197,7 +197,7 @@ class MainWindow(WindowShell):
         self._connect_signals()
         self._apply_options_from_config()
         self._restore_window_geometry()
-        self._refresh_profile_combo()     # 热键套下拉：必须在建好界面之后
+        self._refresh_profile_combo()     # 方案下拉：必须在建好界面之后
         self._register_hotkeys()
         self._refresh_hotkey_conflicts(notify=False)
         self._refresh_status()
@@ -476,9 +476,9 @@ class MainWindow(WindowShell):
             "· 模式一 原速回放：按录制时的间隔重现全部操作，支持暂停与停止",
             "· 模式二 单步热键：按操作单元逐步执行，PageUp/PageDown 控制进度",
             "· 回放期间程序注入的事件会被自动忽略，不会二次录制",
-            "· 热键套：出厂**不占用任何按键**，在「设置 → 热键套」里选一套现成的"
-            "（随软件附带「标准套」），或直接改某个键——第一次改键会自动另存为"
-            "一个新的热键套文件，之后随时切回",
+            "· 快捷键方案：出厂<b>不占用任何按键</b>，在「设置 → 快捷键方案」里选一个现成的"
+            "（随软件附带「标准方案」），或直接改某个键——第一次改键会自动另存为"
+            "一个新方案文件，之后随时切回",
             "· 快捷输入：按热键把一段文本逐字符「敲」进当前输入框，不走剪贴板，"
             "密码框 / 远程桌面 / 禁止粘贴的输入框都能用（默认关闭，需手动开启；"
             "热键可自定义，留空则该功能不占键）",
@@ -2323,12 +2323,12 @@ class MainWindow(WindowShell):
 
         for action, token in hotkeys.items():
             self.config.set_hotkey(action, token)
-        # ★ 第一次改键 → 自动落成一个新的热键套文件（内置套永不改写）。
-        #   已经是用户套时，这里等于把改动写回那个套。
+        # ★ 第一次改键 → 自动落成一个新的方案文件（内置方案永不改写）。
+        #   已经是用户方案时，这里等于把改动写回那个方案。
         created = self.config.ensure_custom_profile()
         self.config.save()
         if created is not None:
-            log.info("已自动新建热键套「%s」（%d 个键）", created.name, created.count)
+            log.info("已自动新建快捷键方案「%s」（%d 个键）", created.name, created.count)
         # 两页各有一部分热键框，都要同步（只更新存在的那些）
         self.page_settings.load_hotkeys(hotkeys)
         self.page_quick.load_hotkeys(hotkeys)
@@ -2338,7 +2338,7 @@ class MainWindow(WindowShell):
             self._register_hotkeys()
             if created is not None:
                 self._set_message(
-                    f"热键已保存，并自动新建热键套「{created.name}」"
+                    f"热键已保存，并自动新建方案「{created.name}」"
                     f"（{created.count} 个键）。")
             else:
                 self._set_message("热键已更新并重新注册。")
@@ -2346,15 +2346,15 @@ class MainWindow(WindowShell):
         return True
 
     # ==================================================================
-    # 热键套（一整套绑定的切换 / 另存 / 删除）
+    # 快捷键方案（一组绑定的切换 / 另存 / 删除）
     # ==================================================================
     def _refresh_profile_combo(self) -> None:
-        """把磁盘上的套列表与当前选择同步到设置页下拉框。"""
+        """把磁盘上的方案列表与当前选择同步到设置页下拉框。"""
         self.page_settings.load_profiles(self.config.hotkey_sets(),
                                          self.config.hotkey_profile)
 
     def _sync_hotkey_pages(self, bindings: dict[str, str]) -> None:
-        """把一份绑定整体灌进两个页面的热键框（换热键套/撤销时用）。"""
+        """把一份绑定整体灌进两个页面的热键框（换方案/撤销时用）。"""
         self.page_settings.apply_hotkeys(bindings)
         self.page_quick.apply_hotkeys(bindings)
         self._refresh_hotkey_conflicts(notify=False)
@@ -2398,17 +2398,17 @@ class MainWindow(WindowShell):
         return bool(dupes)
 
     def _on_hotkey_edited(self, action: str) -> None:
-        """某个热键框被改：先只提示，等「保存」时再落盘并另存为套。
+        """某个热键框被改：先只提示，等「保存」时再落盘并另存为方案。
 
         这里**不能**立刻存盘：用户可能连改好几个键才保存，逐个存盘会造出
-        一堆半成品套文件。
+        一堆半成品方案文件。
         """
         log.info("热键被修改：%s（等保存）", action)
         if self._refresh_hotkey_conflicts(notify=True):
             return          # 状态栏已经在说冲突了，别用「记得保存」把它盖掉
         self._set_message(
             "热键已修改，点「保存设置」后生效——"
-            "第一次改键会自动另存成一个新的热键套，内置套不会被改动。")
+            "第一次改键会自动另存成一个新方案，内置方案不会被改动。")
 
     def _reload_hotkeys_from_config(self) -> None:
         """「撤销热键改动」：把两页的热键框恢复成配置里的样子（不写盘）。"""
@@ -2417,7 +2417,7 @@ class MainWindow(WindowShell):
         self._set_message("已撤销未保存的热键改动。")
 
     def _apply_hotkey_profile(self, key: str) -> None:
-        """换一套热键：整体替换绑定 → 落盘 → 重挂 → 同步两个页面。"""
+        """换一个方案：整体替换绑定 → 落盘 → 重挂 → 同步两个页面。"""
         if key == self.config.hotkey_profile:
             return
         if not key:
@@ -2426,7 +2426,7 @@ class MainWindow(WindowShell):
         else:
             item = find_set(self.config.path, key)
             if item is None:
-                log.warning("热键套 %s 已不存在，忽略本次切换", key)
+                log.warning("方案 %s 已不存在，忽略本次切换", key)
                 self._refresh_profile_combo()
                 return
             self.config.apply_hotkey_set(item)
@@ -2437,17 +2437,17 @@ class MainWindow(WindowShell):
         self._register_hotkeys()
         self._refresh_profile_combo()
         if bindings:
-            self._set_message(f"已启用热键套「{name}」：{len(bindings)} 个键已生效。")
+            self._set_message(f"已启用方案「{name}」：{len(bindings)} 个键已生效。")
         else:
             self._set_message("已停用全部热键：各功能仍可点按钮操作。")
 
     def _save_profile_as(self) -> None:
-        """把当前这些按键另存为一个新的用户套。"""
+        """把当前这些按键另存为一个新的用户方案。"""
         existing = {item.name for item in self.config.hotkey_sets()
                     if not item.builtin}
         name = ask_name(
-            "另存为热键套",
-            "给这套热键起个名字，以后可以在「热键套」下拉里一键切回来。",
+            "另存为方案",
+            "给这个方案起个名字，以后可以在「快捷键方案」下拉里一键切回来。",
             initial=suggest_name(self.config.path),
             hint="文件写在配置目录旁边的 hotkey_sets 文件夹里，可以拷给别人用。",
             existing=existing, parent=self)
@@ -2455,29 +2455,29 @@ class MainWindow(WindowShell):
             return
         item = self.config.save_hotkeys_as_set(name)
         if item is None:
-            self._set_message("热键套保存失败，请检查配置目录是否可写。")
+            self._set_message("方案保存失败，请检查配置目录是否可写。")
             return
         self.config.save()
         self._sync_hotkey_pages(self.config.hotkeys)
         self._register_hotkeys()
         self._refresh_profile_combo()
-        self._set_message(f"已另存为热键套「{item.name}」（{item.count} 个键）。")
+        self._set_message(f"已另存为方案「{item.name}」（{item.count} 个键）。")
 
     def _delete_profile(self) -> None:
-        """删除当前的用户套（内置套不可删）。删完顺便清空绑定。"""
+        """删除当前的用户方案（内置方案不可删）。删完顺便清空绑定。"""
         key = self.config.hotkey_profile
         if not key.startswith(USER_PREFIX):
-            self._set_message("内置的「标准套」不能删除，只能改用它或另存一套。")
+            self._set_message("内置的「标准方案」不能删除，只能改用它或另存一个方案。")
             return
         item = find_set(self.config.path, key)
         if item is None:
             self._refresh_profile_combo()
             return
         if ask_question(
-                self, "删除热键套",
-                f"确定删除热键套「{item.name}」吗？\n\n"
-                "只删这一个套文件；当前生效的热键会一并清空"
-                "（之后可以选别的套，或自己重新设键）。",
+                self, "删除方案",
+                f"确定删除方案「{item.name}」吗？\n\n"
+                "只删这一个方案文件；当前生效的热键会一并清空"
+                "（之后可以选别的方案，或自己重新设键）。",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         delete_set(self.config.path, key)
@@ -2486,7 +2486,7 @@ class MainWindow(WindowShell):
         self._sync_hotkey_pages({})
         self._register_hotkeys()
         self._refresh_profile_combo()
-        self._set_message(f"已删除热键套「{item.name}」，热键已清空。")
+        self._set_message(f"已删除方案「{item.name}」，热键已清空。")
 
     def _save_options(self, options: dict[str, Any]) -> None:
         """保存录制/回放选项（设置页入口）。"""
@@ -2815,7 +2815,7 @@ class MainWindow(WindowShell):
         """按当前状态拼出底部灰色热键提示。
 
         ★ 出厂一个键都不绑，所以每一项都得容忍「空」：没绑的动作直接不显示，
-        全都为空时改口提示去设置页挑一套——不能再像以前那样把动作名当成
+        全都为空时改口提示去设置页挑一个方案——不能再像以前那样把动作名当成
         按键名印上去（``record_start 开始录制`` 这种）。
         """
         def key(action: str) -> str:
@@ -2856,7 +2856,7 @@ class MainWindow(WindowShell):
                                  if action in quick)
                 parts.append(f"{names} 快捷输入")
         parts = [item for item in parts if item]
-        text = "　·　".join(parts) if parts else "尚未设置（到「设置 → 热键套」选一套）"
+        text = "　·　".join(parts) if parts else "尚未设置（到「设置 → 快捷键方案」选一个）"
         if self._hotkey_failures:
             text += "　⚠ 部分热键注册失败，请到设置页修改"
         self.hotkey_label.setText(f"热键：{text}")

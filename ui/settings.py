@@ -7,8 +7,8 @@
 ★ 快捷输入**不在这里**：它已独立成一级页面（``ui/quick_page.py``）。
 两页共用的只有 :class:`HotkeyEdit`（从本模块导入），别再把它搬回去。
 
-★ 出厂不绑任何热键（2026-11-13）：设置页最上面是「热键套」下拉，选中哪一套
-就用哪一套的键；一个都没选时下面 9 个框是空的，表示「这个功能没有热键」。
+★ 出厂不绑任何热键（2026-11-13）：设置页最上面是「快捷键方案」下拉，选中哪个
+就用哪个方案的键；一个都没选时下面 9 个框是空的，表示「这个功能没有热键」。
 详见 :mod:`core.hotkey_sets`。
 """
 
@@ -46,7 +46,7 @@ def _unit_row(field: QWidget, unit: str) -> QWidget:
 #   -> ``pagedown``，而这里原来只写了 pynput 风格的 ``pgdown``，于是用户在热键框
 #   里按 PageDown / PageUp / Insert / Delete / 小键盘 Enter **毫无反应**
 #   （映射查不到 -> 退回 ``event.text()`` -> 这些键没有文本 -> 返回空串）。
-#   标准套里 ``step_next`` 恰好就是 PageDown，用户想改它都改不了。
+#   标准方案里 ``step_next`` 恰好就是 PageDown，用户想改它都改不了。
 #   两种写法都留着：pynput 风格供内部 token 复用，Qt 风格供这里查表。
 _QT_KEY_FALLBACK: dict[str, str] = {
     "pgup": "page_up", "pgdown": "page_down",
@@ -218,9 +218,9 @@ class SettingsPage(QWidget):
     hotkeys_saved = Signal(dict)      # {动作名: token}
     hotkeys_reload = Signal()         # 「撤销热键改动」：从配置重读，不写盘
     hotkey_edited = Signal(str)       # 用户改了某个热键框（动作名）
-    hotkey_profile_changed = Signal(str)   # 换热键套（套的 key，空串 = 不启用）
-    hotkey_profile_save_as = Signal()      # 「另存为新套…」
-    hotkey_profile_delete = Signal()       # 「删除此套」
+    hotkey_profile_changed = Signal(str)   # 换方案（方案的 key，空串 = 不启用）
+    hotkey_profile_save_as = Signal()      # 「另存为新方案…」
+    hotkey_profile_delete = Signal()       # 「删除此方案」
     options_saved = Signal(dict)      # {player.*: 值}
     exclusive_toggled = Signal(bool)  # 热键独占模式开关
     merge_changed = Signal(bool, bool)  # (自动合并组合键, 自动合并双击/三击)
@@ -237,7 +237,7 @@ class SettingsPage(QWidget):
         title.setObjectName("CardTitle")
         outer.addWidget(title)
 
-        hint = QLabel("热键选中一套即可使用；脚本会保存到下方脚本目录。")
+        hint = QLabel("热键在「快捷键方案」里选一个即可使用；脚本会保存到下方脚本目录。")
         hint.setObjectName("Hint")
         outer.addWidget(hint)
 
@@ -253,7 +253,7 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 6, 0)
         layout.setSpacing(12)
 
-        # ------------------------- 热键套 -------------------------
+        # ----------------------- 快捷键方案 -----------------------
         layout.addWidget(self._build_profile_group())
 
         # ------------------------- 热键 -------------------------
@@ -269,10 +269,10 @@ class SettingsPage(QWidget):
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(8)
-            # 出厂是空串：没选热键套时这些框就是空的（= 该功能没有热键）
+            # 出厂是空串：没选方案时这些框就是空的（= 该功能没有热键）
             edit = HotkeyEdit("", row)
             edit.setToolTip(describe)
-            # 改键要通知主窗口：它负责「第一次改键时自动另存为新套」
+            # 改键要通知主窗口：它负责「第一次改键时自动另存为新方案」
             edit.key_captured.connect(lambda _token, a=action: self.hotkey_edited.emit(a))
             self._edits[action] = edit
             row_layout.addWidget(edit)
@@ -421,14 +421,20 @@ class SettingsPage(QWidget):
         outer.addLayout(buttons)
 
     def _build_profile_group(self) -> QGroupBox:
-        """「热键套」：整套绑定一起切换。
+        """「快捷键方案」：整套绑定一起切换。
 
         为什么要有这一层（用户 2026-11-13 的反馈）：13 个功能原来全都硬绑着
         出厂键，一装就占了半个键盘；而且「功能 = 某个键」被写死在提示里，
-        用户改了键，提示还是旧键。现在把「一套键」当对象管理，提示语也跟着
-        当前绑定实时生成（见 ``MainWindow._refresh_sidebar_hints``）。
+        用户改了键，提示还是旧键。现在把「一组按键绑定」当成一个可命名的对象
+        来管理，提示语也跟着当前绑定实时生成（见 ``MainWindow._refresh_sidebar_hints``）。
+
+        叫「方案」而不是「套」（2026-11-13 用户定名）：「套」是量词，当名词用
+        时「当前套 / 删除此套」都得靠上下文补宾语；「方案」是正经名词，也贴行业
+        习惯（JetBrains 的 Keymap 官方中文就叫「键位方案」）。**只改显示文字，
+        内部标识一律不动**——配置键仍叫 ``hotkey_profile``，目录仍是
+        ``hotkey_sets/``，改了就要搬用户的文件，为一个措辞不值。
         """
-        group = QGroupBox("热键套")
+        group = QGroupBox("快捷键方案")
         box = QVBoxLayout(group)
         box.setContentsMargins(10, 8, 10, 8)
         box.setSpacing(8)
@@ -437,37 +443,40 @@ class SettingsPage(QWidget):
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        lay.addWidget(QLabel("当前套"))
+        lay.addWidget(QLabel("当前方案"))
 
         self.combo_profile = QComboBox()
         self.combo_profile.setFixedWidth(300)
         self.combo_profile.setToolTip(
-            "选中一套，下面的热键立刻换成那套的按键（并写入配置）。\n"
-            "「未设置」= 一个键都不占用，全部功能只能点按钮。")
+            "选中一个方案，下面的热键立刻换成那个方案的按键（并写入配置）。\n"
+            "「不使用方案」= 一个键都不占用，全部功能只能点按钮。")
         self.combo_profile.currentIndexChanged.connect(self._on_profile_changed)
         lay.addWidget(self.combo_profile)
 
-        self.btn_profile_save = QPushButton("另存为新套…")
+        self.btn_profile_save = QPushButton("另存为新方案…")
         self.btn_profile_save.setObjectName("GhostButton")
         self.btn_profile_save.setToolTip(
-            "把当前这些按键存成一个新套（可自己起名），\n"
+            "把当前这些按键存成一个新方案（可自己起名），\n"
             "文件写在配置目录旁边的 hotkey_sets 文件夹里。")
         self.btn_profile_save.clicked.connect(self.hotkey_profile_save_as.emit)
         lay.addWidget(self.btn_profile_save)
 
-        self.btn_profile_delete = QPushButton("删除此套")
+        self.btn_profile_delete = QPushButton("删除此方案")
         self.btn_profile_delete.setObjectName("GhostButton")
-        self.btn_profile_delete.setToolTip("删除当前的用户套（内置的「标准套」不能删）")
+        self.btn_profile_delete.setToolTip(
+            "删除当前的用户方案（内置的「标准方案」不能删）")
         self.btn_profile_delete.setEnabled(False)
         self.btn_profile_delete.clicked.connect(self.hotkey_profile_delete.emit)
         lay.addWidget(self.btn_profile_delete)
         lay.addStretch(1)
         box.addWidget(row)
 
+        # ★ 强调用 <b>，不要用 markdown 的 **：QLabel 不认 markdown，
+        #   以前这里写的是 ``**不占用任何按键**``，界面上会把星号原样显示出来。
         hint = QLabel(
-            "· 出厂**不占用任何按键**：选一套现成的，或者直接去改下面某一个键。\n"
-            "· 第一次改键时，当前这套会**自动另存为一个新套**（名字叫「我的热键」），"
-            "之后的改动都写进那个套里，内置套不会被改坏。\n"
+            "· 出厂<b>不占用任何按键</b>：选一个现成的方案，或者直接去改下面某一个键。\n"
+            "· 第一次改键时，当前方案会<b>自动另存为一个新方案</b>（名字叫「我的热键」），"
+            "之后的改动都写进那个方案里，内置方案不会被改坏。\n"
             "· 留空的框表示「这个功能没有热键」，可以照常点按钮操作。")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
@@ -475,7 +484,7 @@ class SettingsPage(QWidget):
         return group
 
     def _on_profile_changed(self, index: int) -> None:
-        """下拉换套：把 key 抛给主窗口（主窗口才知道怎么落盘与重挂）。"""
+        """下拉换方案：把 key 抛给主窗口（主窗口才知道怎么落盘与重挂）。"""
         if index < 0:
             return
         key = str(self.combo_profile.itemData(index) or "")
@@ -483,10 +492,10 @@ class SettingsPage(QWidget):
         self.hotkey_profile_changed.emit(key)
 
     def load_profiles(self, profiles, current_key: str) -> None:
-        """填充「热键套」下拉（不触发切换信号）。"""
+        """填充「快捷键方案」下拉（不触发切换信号）。"""
         self.combo_profile.blockSignals(True)
         self.combo_profile.clear()
-        self.combo_profile.addItem("未设置（不占用任何按键）", "")
+        self.combo_profile.addItem("不使用方案（不占用任何按键）", "")
         for item in profiles:
             suffix = "" if item.builtin else "  ·自定义"
             self.combo_profile.addItem(f"{item.name}{suffix}", item.key)
@@ -543,15 +552,15 @@ class SettingsPage(QWidget):
                 edit.set_token(token)
 
     def apply_hotkeys(self, hotkeys: dict[str, str]) -> None:
-        """整体替换（换热键套用）：没出现在 map 里的框一律清空。"""
+        """整体替换（换方案用）：没出现在 map 里的框一律清空。"""
         for action, edit in self._edits.items():
             edit.set_token(hotkeys.get(action, ""))
 
     def reset_hotkeys(self) -> None:
         """「撤销热键改动」：请主窗口按配置重填，不写盘。
 
-        以前这里是「恢复默认热键」（填 :data:`DEFAULT_HOTKEYS`）。有了热键套
-        之后「默认」不再是一个固定集合——可能是用户自己的套，所以改成
+        以前这里是「恢复默认热键」（填 :data:`DEFAULT_HOTKEYS`）。有了快捷键方案
+        之后「默认」不再是一个固定集合——可能是用户自己的方案，所以改成
         「回到已保存的样子」，这才是用户按这个按钮时真正想要的结果。
         """
         self.hotkeys_reload.emit()

@@ -1684,7 +1684,7 @@ class TestRecordStartHotkey:
     def test_old_config_without_record_start_stays_unbound(self, tmp_path: Path):
         """老配置里没有的键**不会被补默认值**（2026-11-13 起出厂一个键都不绑）。
 
-        以前这里断言「缺的键补成 F12」。改成热键套之后这条规则反过来了：
+        以前这里断言「缺的键补成 F12」。改成「快捷键方案」之后这条规则反过来了：
         配置里没有就是没绑，凭空补一个等于替用户占键。
         """
         path = tmp_path / "config.json"
@@ -2983,10 +2983,10 @@ class TestConfig:
 
 
 # ---------------------------------------------------------------------------
-# 热键套（core/hotkey_sets.py + Config 上的封装）
+# 快捷键方案（core/hotkey_sets.py + Config 上的封装）
 # ---------------------------------------------------------------------------
 class TestHotkeySets:
-    """一套命名好的绑定：内置一套、用户套落盘、切换与自动另存。"""
+    """一组命名好的绑定：内置方案写死、用户方案落盘、切换与自动另存。"""
 
     def test_builtin_standard_present(self, tmp_path: Path):
         items = list_sets(tmp_path / "config.json")
@@ -2994,7 +2994,7 @@ class TestHotkeySets:
         item = items[0]
         assert item.builtin and item.key == STANDARD_KEY
         assert item.hotkeys == STANDARD_HOTKEYS
-        # 标准套必须覆盖全部 13 个动作，否则换上去会丢功能
+        # 标准方案必须覆盖全部 13 个动作，否则换上去会丢功能
         assert len(item.hotkeys) == 13
 
     def test_save_set_writes_file(self, tmp_path: Path):
@@ -3006,9 +3006,9 @@ class TestHotkeySets:
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["name"] == "游戏专用"
         assert raw["hotkeys"] == {"record_stop": "f9"}
-        # 再读回来能看见它，且排在内置套后面
+        # 再读回来能看见它，且排在内置方案后面
         names = [i.name for i in list_sets(cfg_path)]
-        assert names[0].startswith("标准套")
+        assert names[0].startswith("标准方案")
         assert "游戏专用" in names
 
     def test_save_same_name_overwrites(self, tmp_path: Path):
@@ -3052,7 +3052,7 @@ class TestHotkeySets:
 
 
 class TestHotkeyProfile:
-    """「热键套」在配置对象上的行为。"""
+    """「快捷键方案」在配置对象上的行为。"""
 
     def test_apply_and_clear(self, tmp_path: Path):
         cfg = Config(tmp_path / "config.json")
@@ -3076,7 +3076,7 @@ class TestHotkeyProfile:
         assert not (tmp_path / "hotkey_sets").exists()
 
     def test_edit_from_builtin_creates_new_set(self, tmp_path: Path):
-        """第一次改键：内置套不动，另存一个用户套。"""
+        """第一次改键：内置方案不动，另存一个用户方案。"""
         cfg = Config(tmp_path / "config.json")
         cfg.apply_hotkey_set(find_set(cfg.path, STANDARD_KEY))
         cfg.set_hotkey("record_stop", "f10")          # 用户改了停止录制
@@ -3085,7 +3085,7 @@ class TestHotkeyProfile:
         assert item is not None and item.name == "我的热键"
         assert cfg.hotkey_profile == "user:我的热键"
         assert item.hotkeys["record_stop"] == "f10"
-        # 内置套保持原样
+        # 内置方案保持原样
         assert find_set(cfg.path, STANDARD_KEY).hotkeys["record_stop"] == "f9"
         # 再改一次：写回同一个套，不再新建
         cfg.set_hotkey("record_pause", "f12")
@@ -4320,10 +4320,10 @@ class TestQuickInputConfig:
         assert cfg.quick_delay_ms == 8
 
     def test_hotkeys_unbound_by_default(self, cfg):
-        """快捷输入的四条热键出厂也不绑（由热键套决定）。"""
+        """快捷输入的四条热键出厂也不绑（由快捷键方案决定）。"""
         assert cfg.hotkey("quick_paste") == ""
         assert [cfg.hotkey(f"quick_pwd_{i}") for i in (1, 2, 3)] == ["", "", ""]
-        # 「标准套」里仍然有这四个键，选它就能用
+        # 「标准方案」里仍然有这四个键，选它就能用
         for action in QUICK_HOTKEY_ACTIONS:
             assert action in STANDARD_HOTKEYS
 

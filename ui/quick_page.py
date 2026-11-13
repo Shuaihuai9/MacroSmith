@@ -54,7 +54,7 @@ class QuickInputPage(QWidget):
     #: 总开关被勾选/取消：**立即生效并落盘**，不必等保存按钮
     #: （否则「我明明开了，重启又关了」是必然发生的困惑）
     enabled_toggled = Signal(bool)
-    #: 某个热键框被改了（动作名）：主窗口据此在第一次改键时另存为新热键套
+    #: 某个热键框被改了（动作名）：主窗口据此在第一次改键时另存为新方案
     hotkey_edited = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -400,7 +400,7 @@ class QuickInputPage(QWidget):
         self.refresh_hotkey_summary()
 
     def apply_hotkeys(self, hotkeys: dict[str, str]) -> None:
-        """整体替换（换热键套用）：没出现在 map 里的框一律清空。"""
+        """整体替换（换方案用）：没出现在 map 里的框一律清空。"""
         for action, edit in self._edits.items():
             edit.set_token(hotkeys.get(action, ""))
         self.refresh_hotkey_summary()

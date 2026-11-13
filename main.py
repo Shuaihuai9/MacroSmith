@@ -196,9 +196,9 @@ def main() -> int:
     except Exception:  # pragma: no cover - 升级失败不该拦住启动
         log.warning("升级快捷密码加密格式失败", exc_info=True)
 
-    # 1.2.0 及以前每个动作都有出厂热键，配置里躺着一整套绑定却没有「热键套」。
+    # 1.2.0 及以前每个动作都有出厂热键，配置里躺着一整套绑定却没有「快捷键方案」。
     # 不迁移的话，用户升级后下拉显示「未设置」而按键其实还在生效——界面和
-    # 现实对不上。这里把它们原样存成「我的热键」套（见 core.hotkey_sets）。
+    # 现实对不上。这里把它们原样存成「我的热键」方案（见 core.hotkey_sets）。
     try:
         if config.migrate_hotkey_profile():
             config.save()
@@ -237,7 +237,7 @@ def run_startup_check(app, window, log) -> int:
         app.processEvents()
 
     hotkeys = window.hotkeys.display_map()
-    # 热键套：出厂一个键都不绑，所以这里只能校验「有绑定的那些是否有效」，
+    # 快捷键方案：出厂一个键都不绑，所以这里只能校验「有绑定的那些是否有效」，
     # 不能再像以前那样要求 9 个动作全都在。
     from core.hotkey_manager import parse_key as _parse_key
     profile_key = window.config.hotkey_profile
@@ -373,7 +373,7 @@ def run_startup_check(app, window, log) -> int:
         ("热键独占模式", window.hotkeys.exclusive,
          "已开启（命中热键不再传给前台程序）" if window.hotkeys.exclusive
          else "已关闭（按键会同时触发前台程序）"),
-        ("热键套", profile_ok,
+        ("快捷键方案", profile_ok,
          (f"当前：{profile_item.name}（{profile_item.count} 个键）" if profile_item
           else "未设置：出厂不占用任何按键，由用户选择或自定义")),
         ("热键绑定有效", bindings_ok,

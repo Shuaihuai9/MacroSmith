@@ -173,7 +173,19 @@ def main() -> int:
         window._set_message("循环回放：固定 5 轮，正在执行第 2 轮。F7 暂停 / F8 停止依然有效。")
 
     def shot_settings() -> None:
+        """「设置」页：让「快捷键方案」这一栏有内容可看。
+
+        出厂是一个键都不绑的，直接截会得到 9 个「点击后按键」的空框——
+        文档读者看不出「方案」是干什么的。这里选中随软件附带的标准方案，
+        框里才会出现 F12 / F9 这些真实键名（只写进临时配置，不影响任何人）。
+        """
         window._show_page(PAGE_SETTINGS)
+        from core.hotkey_sets import STANDARD_KEY
+
+        combo = window.page_settings.combo_profile
+        combo.setCurrentIndex(combo.findData(STANDARD_KEY))
+        window._set_message("改动后点「保存设置」生效；"
+                            "第一次改键会自动另存为一个新方案，内置方案不会被改坏。")
 
     def grab(name: str) -> Callable[[], None]:
         def inner() -> None:

@@ -6,7 +6,7 @@
 配置结构（节选）::
 
     {
-      "hotkey_profile": "builtin:standard",   # 当前启用的「热键套」，空串 = 一个键都不绑
+      "hotkey_profile": "builtin:standard",   # 当前启用的「快捷键方案」，空串 = 一个键都不绑
       "hotkeys": {"record_start": "f12", "record_stop": "f9", ...},
       "window":  {"x": null, "y": null, "width": 1000, "height": 700},
       "player":  {"default_mode": "timed", "speed": 1.0, ...},
@@ -15,8 +15,8 @@
     }
 
 ★ ``hotkeys`` 是**当前生效**的绑定，出厂是空字典（一个键都不占）。
-用户从「热键套」下拉里选一套、或者自己改某个键，才会往里写东西；
-套文件本身放在 ``<config 同目录>/hotkey_sets/`` 下，见 :mod:`core.hotkey_sets`。
+用户从「快捷键方案」下拉里选一个、或者自己改某个键，才会往里写东西；
+方案文件本身放在 ``<config 同目录>/hotkey_sets/`` 下，见 :mod:`core.hotkey_sets`。
 """
 
 from __future__ import annotations
@@ -45,9 +45,9 @@ _LEGACY_DEFAULT_SIZES: tuple[tuple[int, int], ...] = (
 
 log = logging.getLogger(__name__)
 
-#: 「标准套」的按键定义。**不是出厂绑定**——出厂一个键都不绑，
-#: 用户从「热键套」下拉里选中它，这些键才会被注册。
-#: 保留这个名字是因为大量代码与测试拿它当「那套熟悉的热键」的参照。
+#: 「标准方案」的按键定义。**不是出厂绑定**——出厂一个键都不绑，
+#: 用户从「快捷键方案」下拉里选中它，这些键才会被注册。
+#: 保留这个名字是因为大量代码与测试拿它当「那组熟悉的热键」的参照。
 DEFAULT_HOTKEYS: dict[str, str] = dict(STANDARD_HOTKEYS)
 
 #: 「快捷输入」专用的热键动作。它们有自己的设置区域（含密码框），
@@ -83,9 +83,9 @@ QUICK_HOTKEY_LABELS: dict[str, str] = {
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # ★ 出厂不绑任何热键：F1–F12 在别的软件里各有用途，装完就抢键会被当成
-    #   「键盘坏了」。用户选一个「热键套」或自己改某个键之后才会有绑定。
+    #   「键盘坏了」。用户选一个「快捷键方案」或自己改某个键之后才会有绑定。
     "hotkeys": {},
-    #: 当前生效的热键套标识（``builtin:standard`` / ``user:我的热键`` / 空串）
+    #: 当前生效的方案标识（``builtin:standard`` / ``user:我的热键`` / 空串）
     "hotkey_profile": "",
     "window": {"x": None, "y": None, "width": DEFAULT_WINDOW_WIDTH,
                "height": DEFAULT_WINDOW_HEIGHT},
@@ -246,7 +246,7 @@ class Config:
         return sanitize_bindings(self.data.get("hotkeys") or {})
 
     def hotkey(self, action: str) -> str:
-        """某个动作当前的按键；**没绑定时返回空串**（不再回落到标准套）。"""
+        """某个动作当前的按键；**没绑定时返回空串**（不再回落到标准方案）。"""
         return str(self.get(f"hotkeys.{action}", "") or "")
 
     def set_hotkey(self, action: str, key: str) -> None:
@@ -263,85 +263,85 @@ class Config:
             hk.pop(action, None)
 
     # ------------------------------------------------------------------
-    # 热键套（一套命名好的绑定）
+    # 快捷键方案（一组命名好的绑定）
     # ------------------------------------------------------------------
     @property
     def hotkey_profile(self) -> str:
-        """当前生效的套：``builtin:standard`` / ``user:<文件名>`` / 空串。"""
+        """当前生效的方案：``builtin:standard`` / ``user:<文件名>`` / 空串。"""
         return str(self.get("hotkey_profile", "") or "")
 
     def set_hotkey_profile(self, key: str) -> None:
         self.set("hotkey_profile", str(key or ""))
 
     def hotkey_sets(self) -> list[HotkeySet]:
-        """全部可选的套（内置 + 磁盘上的用户套）。"""
+        """全部可选的方案（内置 + 磁盘上的用户方案）。"""
         return list_sets(self.path)
 
     def current_hotkey_set(self) -> Optional[HotkeySet]:
-        """当前套对象；没选套、或文件已被删掉时返回 ``None``。"""
+        """当前方案对象；没选方案、或文件已被删掉时返回 ``None``。"""
         return find_set(self.path, self.hotkey_profile)
 
     def apply_hotkey_set(self, item: HotkeySet) -> None:
-        """整体换成另一套（覆盖当前绑定并记下 profile，**不落盘**）。"""
+        """整体换成另一个方案（覆盖当前绑定并记下 profile，**不落盘**）。"""
         self.data["hotkeys"] = sanitize_bindings(item.hotkeys)
         self.set_hotkey_profile(item.key)
 
     def clear_hotkeys(self) -> None:
-        """不启用任何热键套：一个键都不绑。"""
+        """不启用任何方案：一个键都不绑。"""
         self.data["hotkeys"] = {}
         self.set_hotkey_profile("")
 
     def save_hotkeys_as_set(self, name: str) -> Optional[HotkeySet]:
-        """把当前绑定存成一个用户套（同名覆盖），并切到它。"""
+        """把当前绑定存成一个用户方案（同名覆盖），并切到它。"""
         item = save_set(self.path, name, self.hotkeys)
         if item is not None:
             self.set_hotkey_profile(item.key)
         return item
 
     def ensure_custom_profile(self) -> Optional[HotkeySet]:
-        """用户改了某个键之后调用：保证改动落在**用户自己的套**里。
+        """用户改了某个键之后调用：保证改动落在**用户自己的方案**里。
 
-        * 绑定和当前套**完全一样**（只是点了保存、没改键）→ 什么都不做。
-          这一条很关键：不加的话，用户随手点一下「保存设置」就会把内置套
+        * 绑定和当前方案**完全一样**（只是点了保存、没改键）→ 什么都不做。
+          这一条很关键：不加的话，用户随手点一下「保存设置」就会把内置方案
           悄悄复制成「我的热键」，下拉里凭空多一项。
-        * 当前已经是用户套 → 覆盖那个套的文件（返回 ``None``，不算新建）；
-        * 当前是内置套或没选套 → **自动新建**一个套文件（名字 ``我的热键``，
+        * 当前已经是用户方案 → 覆盖那个方案的文件（返回 ``None``，不算新建）；
+        * 当前是内置方案或没选方案 → **自动新建**一个方案文件（名字 ``我的热键``，
           重名自动加序号），并把 profile 切过去。
 
-        这样「改了一个键」不会污染内置套，用户下次也能在下拉里找回这一套；
-        而第一次改键就是用户第一次拥有自己的套。
+        这样「改了一个键」不会污染内置方案，用户下次也能在下拉里找回这个方案；
+        而第一次改键就是用户第一次拥有自己的方案。
         """
         bindings = self.hotkeys
         current = self.current_hotkey_set()
         if current is None and not bindings:
-            return None                    # 一个键都没有：没有可存的套
+            return None                    # 一个键都没有：没有可存的方案
         if current is not None and bindings == sanitize_bindings(current.hotkeys):
             return None                    # 没改键
         if current is not None and not current.builtin:
-            save_set(self.path, current.name, bindings)   # 写回同一个套
+            save_set(self.path, current.name, bindings)   # 写回同一个方案
             return None
         return self.save_hotkeys_as_set(suggest_name(self.path))
 
     def migrate_hotkey_profile(self) -> bool:
-        """把「有绑定但没有套」的老配置迁移成用户套（返回是否发生了迁移）。
+        """把「有绑定但没有方案」的老配置迁移成用户方案（返回是否发生了迁移）。
 
         1.2.0 及之前每个动作都有出厂键，配置文件里躺着一整套绑定却没有
         ``hotkey_profile``。不迁移的话，用户升级后下拉框显示「未设置」，
         但他改过的键其实还在生效——界面和现实对不上。这里把它们原样存成
-        「我的热键」套，profile 指向它，界面与现实立刻一致。
+        「我的热键」方案，profile 指向它，界面与现实立刻一致。
         """
         current = self.hotkey_profile
         if current and find_set(self.path, current) is not None:
             return False
         if current:
-            log.warning("配置里的热键套 %s 已不存在，按现有绑定重建", current)
+            log.warning("配置里的方案 %s 已不存在，按现有绑定重建", current)
             self.set_hotkey_profile("")
         if not self.hotkeys:
             return False
         item = self.save_hotkeys_as_set(suggest_name(self.path))
         if item is None:
             return False
-        log.info("已把现有热键绑定另存为热键套「%s」（%d 个键）",
+        log.info("已把现有热键绑定另存为方案「%s」（%d 个键）",
                  item.name, item.count)
         return True
 
